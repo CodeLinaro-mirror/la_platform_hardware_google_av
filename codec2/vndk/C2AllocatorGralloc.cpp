@@ -114,6 +114,9 @@ private:
         uint32_t usage_lo;
         uint32_t usage_hi;
         uint32_t stride;
+        uint32_t igbp_id_lo;
+        uint32_t igbp_id_hi;
+        uint32_t igbp_slot;
         uint32_t magic;
     };
 
@@ -139,6 +142,12 @@ private:
     }
 
 public:
+    void getIgbpData(uint64_t *igbp_id, uint32_t *igbp_slot) const {
+        const ExtraData *ed = getExtraData(this);
+        *igbp_id = unsigned(ed->igbp_id_lo) | uint64_t(unsigned(ed->igbp_id_hi)) << 32;
+        *igbp_slot = ed->igbp_slot;
+    }
+
     static bool isValid(const C2Handle *const o) {
         if (o == nullptr) { // null handle is always valid
             return true;
@@ -150,7 +159,8 @@ public:
 
     static C2HandleGralloc* WrapNativeHandle(
             const native_handle_t *const handle,
-            uint32_t width, uint32_t height, uint32_t format, uint64_t usage, uint32_t stride) {
+            uint32_t width, uint32_t height, uint32_t format, uint64_t usage,
+            uint32_t stride, uint64_t igbp_id = 0, uint32_t igbp_slot = 0) {
         //CHECK(handle != nullptr);
         if (native_handle_is_invalid(handle) ||
             handle->numInts > int((INT_MAX - handle->version) / sizeof(int)) - NUM_INTS - handle->numFds) {
@@ -158,7 +168,7 @@ public:
         }
         ExtraData xd = {
             width, height, format, uint32_t(usage & 0xFFFFFFFF), uint32_t(usage >> 32),
-            stride, MAGIC
+            stride, uint32_t(igbp_id & 0xFFFFFFFF), uint32_t(igbp_id >> 32), igbp_slot, MAGIC
         };
         native_handle_t *res = native_handle_create(handle->numFds, handle->numInts + NUM_INTS);
         if (res != nullptr) {
@@ -168,7 +178,8 @@ public:
         return reinterpret_cast<C2HandleGralloc *>(res);
     }
 
-    static native_handle_t* UnwrapNativeHandle(const C2Handle *const handle) {
+    static native_handle_t* UnwrapNativeHandle(
+            const C2Handle *const handle) {
         const ExtraData *xd = getExtraData(handle);
         if (xd == nullptr || xd->magic != MAGIC) {
             return nullptr;
@@ -180,10 +191,26 @@ public:
         return res;
     }
 
+    static native_handle_t* UnwrapNativeHandle(
+            const C2Handle *const handle, uint64_t *igbp_id, uint32_t *igbp_slot) {
+        const ExtraData *xd = getExtraData(handle);
+        if (xd == nullptr || xd->magic != MAGIC) {
+            return nullptr;
+        }
+        *igbp_id = unsigned(xd->igbp_id_lo) | uint64_t(unsigned(xd->igbp_id_hi)) << 32;
+        *igbp_slot = xd->igbp_slot;
+        native_handle_t *res = native_handle_create(handle->numFds, handle->numInts - NUM_INTS);
+        if (res != nullptr) {
+            memcpy(&res->data, &handle->data, sizeof(int) * (res->numFds + res->numInts));
+        }
+        return res;
+    }
+
     static const C2HandleGralloc* Import(
             const C2Handle *const handle,
             uint32_t *width, uint32_t *height, uint32_t *format,
-            uint64_t *usage, uint32_t *stride) {
+            uint64_t *usage, uint32_t *stride,
+            uint64_t *igbp_id, uint32_t *igbp_slot) {
         const ExtraData *xd = getExtraData(handle);
         if (xd == nullptr) {
             return nullptr;
@@ -193,7 +220,8 @@ public:
         *format = xd->format;
         *usage = xd->usage_lo | (uint64_t(xd->usage_hi) << 32);
         *stride = xd->stride;
-
+        *igbp_id = xd->igbp_id_lo | (uint64_t(xd->igbp_id_hi) << 32);
+        *igbp_slot = xd->igbp_slot;
         return reinterpret_cast<const C2HandleGralloc *>(handle);
     }
 };
@@ -202,10 +230,15 @@ native_handle_t *UnwrapNativeCodec2GrallocHandle(const C2Handle *const handle) {
     return C2HandleGralloc::UnwrapNativeHandle(handle);
 }
 
+native_handle_t *UnwrapNativeCodec2GrallocHandle(
+        const C2Handle *const handle, uint64_t *igbp_id, uint32_t *igbp_slot) {
+    return C2HandleGralloc::UnwrapNativeHandle(handle, igbp_id, igbp_slot);
+}
+
 C2Handle *WrapNativeCodec2GrallocHandle(
         const native_handle_t *const handle,
-        uint32_t width, uint32_t height, uint32_t format, uint64_t usage, uint32_t stride) {
-    return C2HandleGralloc::WrapNativeHandle(handle, width, height, format, usage, stride);
+        uint32_t width, uint32_t height, uint32_t format, uint64_t usage, uint32_t stride, uint64_t igbp_id, uint32_t igbp_slot) {
+    return C2HandleGralloc::WrapNativeHandle(handle, width, height, format, usage, stride, igbp_id, igbp_slot);
 }
 
 class C2AllocationGralloc : public C2GraphicAllocation {
@@ -277,9 +310,12 @@ C2AllocationGralloc::~C2AllocationGralloc() {
 c2_status_t C2AllocationGralloc::map(
         C2Rect rect, C2MemoryUsage usage, C2Fence *fence,
         C2PlanarLayout *layout /* nonnull */, uint8_t **addr /* nonnull */) {
+    uint64_t grallocUsage = static_cast<C2AndroidMemoryUsage>(usage).asGrallocUsage();
+    ALOGV("mapping buffer with usage %#llx => %#llx",
+          (long long)usage.expected, (long long)grallocUsage);
+
     // TODO
     (void) fence;
-    (void) usage;
 
     if (mBuffer && mLocked) {
         return C2_DUPLICATE;
@@ -303,9 +339,14 @@ c2_status_t C2AllocationGralloc::map(
         if (mBuffer == nullptr) {
             return C2_CORRUPTED;
         }
+        uint64_t igbp_id = 0;
+        uint32_t igbp_slot = 0;
+        if (mHandle) {
+            mHandle->getIgbpData(&igbp_id, &igbp_slot);
+        }
         mLockedHandle = C2HandleGralloc::WrapNativeHandle(
                 mBuffer, mInfo.mapperInfo.width, mInfo.mapperInfo.height,
-                (uint32_t)mInfo.mapperInfo.format, mInfo.mapperInfo.usage, mInfo.stride);
+                (uint32_t)mInfo.mapperInfo.format, mInfo.mapperInfo.usage, mInfo.stride, igbp_id, igbp_slot);
     }
 
     switch (mInfo.mapperInfo.format) {
@@ -313,8 +354,7 @@ c2_status_t C2AllocationGralloc::map(
         case PixelFormat::YV12: {
             YCbCrLayout ycbcrLayout;
             mMapper->lockYCbCr(
-                    const_cast<native_handle_t *>(mBuffer),
-                    BufferUsage::CPU_READ_OFTEN | BufferUsage::CPU_WRITE_OFTEN,
+                    const_cast<native_handle_t *>(mBuffer), grallocUsage,
                     { (int32_t)rect.left, (int32_t)rect.top, (int32_t)rect.width, (int32_t)rect.height },
                     // TODO: fence
                     hidl_handle(),
@@ -393,7 +433,7 @@ c2_status_t C2AllocationGralloc::map(
             void *pointer = nullptr;
             mMapper->lock(
                     const_cast<native_handle_t *>(mBuffer),
-                    BufferUsage::CPU_READ_OFTEN | BufferUsage::CPU_WRITE_OFTEN,
+                    grallocUsage,
                     { (int32_t)rect.left, (int32_t)rect.top, (int32_t)rect.width, (int32_t)rect.height },
                     // TODO: fence
                     hidl_handle(),
@@ -523,6 +563,13 @@ private:
     sp<IMapper> mMapper;
 };
 
+void _UnwrapNativeCodec2GrallocMetadata(
+        const C2Handle *const handle,
+        uint32_t *width, uint32_t *height, uint32_t *format,uint64_t *usage, uint32_t *stride,
+        uint64_t *igbp_id, uint32_t *igbp_slot) {
+    (void)C2HandleGralloc::Import(handle, width, height, format, usage, stride, igbp_id, igbp_slot);
+}
+
 C2AllocatorGralloc::Impl::Impl(id_t id) : mInit(C2_OK) {
     // TODO: get this from allocator
     C2MemoryUsage minUsage = { 0, 0 }, maxUsage = { ~(uint64_t)0, ~(uint64_t)0 };
@@ -540,8 +587,9 @@ C2AllocatorGralloc::Impl::Impl(id_t id) : mInit(C2_OK) {
 c2_status_t C2AllocatorGralloc::Impl::newGraphicAllocation(
         uint32_t width, uint32_t height, uint32_t format, const C2MemoryUsage &usage,
         std::shared_ptr<C2GraphicAllocation> *allocation) {
-    // TODO: buffer usage should be determined according to |usage|
-    (void) usage;
+    uint64_t grallocUsage = static_cast<C2AndroidMemoryUsage>(usage).asGrallocUsage();
+    ALOGV("allocating buffer with usage %#llx => %#llx",
+          (long long)usage.expected, (long long)grallocUsage);
 
     BufferDescriptorInfo info = {
         {
@@ -549,7 +597,7 @@ c2_status_t C2AllocatorGralloc::Impl::newGraphicAllocation(
             height,
             1u,  // layerCount
             (PixelFormat)format,
-            BufferUsage::CPU_READ_OFTEN | BufferUsage::CPU_WRITE_OFTEN,
+            grallocUsage,
         },
         0u,  // stride placeholder
     };
@@ -603,16 +651,20 @@ c2_status_t C2AllocatorGralloc::Impl::priorGraphicAllocation(
         std::shared_ptr<C2GraphicAllocation> *allocation) {
     BufferDescriptorInfo info;
     info.mapperInfo.layerCount = 1u;
+    uint64_t igbp_id;
+    uint32_t igbp_slot;
     const C2HandleGralloc *grallocHandle = C2HandleGralloc::Import(
             handle,
             &info.mapperInfo.width, &info.mapperInfo.height,
-            (uint32_t *)&info.mapperInfo.format, (uint64_t *)&info.mapperInfo.usage, &info.stride);
+            (uint32_t *)&info.mapperInfo.format, (uint64_t *)&info.mapperInfo.usage, &info.stride,
+            &igbp_id, &igbp_slot);
     if (grallocHandle == nullptr) {
         return C2_BAD_VALUE;
     }
 
     hidl_handle hidlHandle;
     hidlHandle.setTo(C2HandleGralloc::UnwrapNativeHandle(grallocHandle), true);
+
     allocation->reset(new C2AllocationGralloc(info, mMapper, hidlHandle, grallocHandle, mTraits->id));
     return C2_OK;
 }

@@ -20,6 +20,7 @@
 #include <chrono>
 
 #include <C2Component.h>
+#include <codec2/hidl/client.h>
 
 #include <android/native_window.h>
 #include <media/hardware/MetadataBufferType.h>
@@ -31,6 +32,8 @@
 #include <utils/NativeHandle.h>
 #include <hardware/gralloc.h>
 #include <nativebase/nativebase.h>
+
+#include "ReflectedParamUpdater.h"
 
 namespace android {
 
@@ -55,7 +58,7 @@ public:
     virtual void signalFlush() override;
     virtual void signalResume() override;
 
-    virtual void signalSetParameters(const sp<AMessage> &msg) override;
+    virtual void signalSetParameters(const sp<AMessage> &params) override;
     virtual void signalEndOfInputStream() override;
     virtual void signalRequestIDRFrame() override;
 
@@ -85,6 +88,13 @@ private:
     void createInputSurface();
     void setInputSurface(const sp<PersistentSurface> &surface);
     status_t setupInputSurface(const std::shared_ptr<InputSurfaceWrapper> &surface);
+    void setParameters(const sp<AMessage> &params);
+
+    // initializes the standard MediaCodec to Codec 2.0 params mapping
+    void initializeStandardParams();
+
+    // filters out vendor and standard parameters and returns them in a separate message
+    sp<AMessage> filterParameters(const sp<AMessage> &params) const;
 
     void setDeadline(const TimePoint &deadline, const char *name);
 
@@ -97,6 +107,8 @@ private:
         kWhatRelease,
         kWhatCreateInputSurface,
         kWhatSetInputSurface,
+        kWhatSetParameters,
+
         kWhatWorkDone,
     };
 
@@ -119,7 +131,7 @@ private:
         inline int get() const { return mState; }
         inline void set(int newState) { mState = newState; }
 
-        std::shared_ptr<C2Component> comp;
+        std::shared_ptr<Codec2Client::Component> comp;
     private:
         int mState;
     };
@@ -146,10 +158,17 @@ private:
 
     Mutexed<State> mState;
     std::shared_ptr<CCodecBufferChannel> mChannel;
-    std::shared_ptr<C2Component::Listener> mListener;
+
+    std::shared_ptr<Codec2Client> mClient;
+    std::shared_ptr<Codec2Client::Listener> mClientListener;
+    struct ClientListener;
+
     Mutexed<NamedTimePoint> mDeadline;
     Mutexed<Formats> mFormats;
     Mutexed<std::list<std::unique_ptr<C2Work>>> mWorkDoneQueue;
+    Mutexed<ReflectedParamUpdater> mParamUpdater;
+    // standard MediaCodec to Codec 2.0 params mapping
+    std::map<std::string, std::string> mStandardParams;
 
     DISALLOW_EVIL_CONSTRUCTORS(CCodec);
 };
