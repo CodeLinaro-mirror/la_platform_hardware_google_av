@@ -24,8 +24,7 @@
 
 #include <C2BufferPriv.h>
 #include <C2BlockInternal.h>
-
-#include <ClientManager.h>
+#include <bufferpool/ClientManager.h>
 
 namespace {
 
@@ -103,8 +102,6 @@ class BufferDataBuddy : public C2BufferData {
 }  // namespace
 
 /* ========================================== 1D BLOCK ========================================= */
-
-struct C2_HIDE _C2BlockPoolData;
 
 /**
  * This class is the base class for all 1D block and view implementations.
@@ -622,6 +619,8 @@ public:
           mAllocation(alloc),
           mPoolData(poolData) { }
 
+    virtual ~_C2Block2DImpl() = default;
+
     /** returns const pool data  */
     std::shared_ptr<const _C2BlockPoolData> poolData() const {
         return mPoolData;
@@ -651,6 +650,8 @@ class C2_HIDE _C2MappingBlock2DImpl
     : public _C2Block2DImpl, public std::enable_shared_from_this<_C2MappingBlock2DImpl> {
 public:
     using _C2Block2DImpl::_C2Block2DImpl;
+
+    virtual ~_C2MappingBlock2DImpl() override = default;
 
     /**
      * This class contains the mapped data pointer, and the potential error.
@@ -771,6 +772,8 @@ public:
         : _C2Block2DImpl(impl), mMapping(mapping) {
     }
 
+    virtual ~_C2MappedBlock2DImpl() override = default;
+
     std::shared_ptr<_C2MappingBlock2DImpl::Mapped> mapping() const { return mMapping; }
 
 private:
@@ -781,7 +784,9 @@ private:
  * Block implementation.
  */
 class C2Block2D::Impl : public _C2MappingBlock2DImpl {
+public:
     using _C2MappingBlock2DImpl::_C2MappingBlock2DImpl;
+    virtual ~Impl() override = default;
 };
 
 const C2Handle *C2Block2D::handle() const {
@@ -804,7 +809,9 @@ C2Block2D::C2Block2D(std::shared_ptr<Impl> impl, const _C2PlanarSectionAspect &s
  * crop.
  */
 class C2GraphicView::Impl : public _C2MappedBlock2DImpl {
+public:
     using _C2MappedBlock2DImpl::_C2MappedBlock2DImpl;
+    virtual ~Impl() override = default;
 };
 
 C2GraphicView::C2GraphicView(std::shared_ptr<Impl> impl, const _C2PlanarSectionAspect &section)
