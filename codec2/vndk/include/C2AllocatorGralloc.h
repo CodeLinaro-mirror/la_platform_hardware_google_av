@@ -41,14 +41,16 @@ native_handle_t *UnwrapNativeCodec2GrallocHandle(const C2Handle *const handle);
  */
 C2Handle *WrapNativeCodec2GrallocHandle(
         const native_handle_t *const handle,
-        uint32_t width, uint32_t height, uint32_t format, uint64_t usage, uint32_t stride);
+        uint32_t width, uint32_t height, uint32_t format, uint64_t usage, uint32_t stride,
+        uint64_t igbp_id = 0, uint32_t igbp_slot = 0);
 
 /**
  * \todo Get this from the buffer
  */
 void _UnwrapNativeCodec2GrallocMetadata(
         const C2Handle *const handle,
-        uint32_t *width, uint32_t *height, uint32_t *format, uint64_t *usage, uint32_t *stride);
+        uint32_t *width, uint32_t *height, uint32_t *format, uint64_t *usage, uint32_t *stride,
+        uint64_t *igbp_id, uint32_t *igbp_slot);
 
 class C2AllocatorGralloc : public C2Allocator {
 public:
@@ -73,6 +75,8 @@ public:
     virtual ~C2AllocatorGralloc() override;
 
     static bool isValid(const C2Handle* const o);
+
+    static void useIgbp(const C2Handle* const o);
 
 private:
     class Impl;
