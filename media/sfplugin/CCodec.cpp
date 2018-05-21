@@ -21,12 +21,14 @@
 
 #include <thread>
 
+#include <C2Config.h>
 #include <C2ParamInternal.h>
 #include <C2PlatformSupport.h>
 #include <C2V4l2Support.h>
 
 #include <android/IOMXBufferSource.h>
 #include <android/IGraphicBufferSource.h>
+#include <cutils/properties.h>
 #include <gui/bufferqueue/1.0/H2BGraphicBufferProducer.h>
 #include <gui/IGraphicBufferProducer.h>
 #include <gui/Surface.h>
@@ -124,41 +126,6 @@ private:
 
 Mutexed<sp<CCodecWatchdog>> CCodecWatchdog::sInstance;
 
-class CCodecListener : public Codec2Client::Listener {
-public:
-    explicit CCodecListener(const wp<CCodec> &codec) : mCodec(codec) {}
-
-    virtual void onWorkDone(
-            const std::weak_ptr<Codec2Client::Component>& component,
-            std::list<std::unique_ptr<C2Work>>& workItems) override {
-        (void)component;
-        sp<CCodec> codec(mCodec.promote());
-        if (!codec) {
-            return;
-        }
-        codec->onWorkDone(workItems);
-    }
-
-    virtual void onTripped(
-            const std::weak_ptr<Codec2Client::Component>& component,
-            const std::vector<std::shared_ptr<C2SettingResult>>& settingResult) override {
-        // TODO
-        (void)component;
-        (void)settingResult;
-    }
-
-    virtual void onError(
-            const std::weak_ptr<Codec2Client::Component>& component,
-            uint32_t errorCode) override {
-        // TODO
-        (void)component;
-        (void)errorCode;
-    }
-
-private:
-    wp<CCodec> mCodec;
-};
-
 class C2InputSurfaceWrapper : public InputSurfaceWrapper {
 public:
     explicit C2InputSurfaceWrapper(
@@ -181,6 +148,16 @@ public:
             mConnection->disconnect();
             mConnection = nullptr;
         }
+    }
+
+    status_t signalEndOfInputStream() override {
+        C2InputSurfaceEosTuning eos(true);
+        std::vector<std::unique_ptr<C2SettingResult>> failures;
+        c2_status_t err = mSurface->getConfigurable()->config({&eos}, C2_MAY_BLOCK, &failures);
+        if (err != C2_OK) {
+            return UNKNOWN_ERROR;
+        }
+        return OK;
     }
 
 private:
@@ -234,6 +211,20 @@ public:
         mNode.clear();
     }
 
+    status_t signalEndOfInputStream() override {
+        binder::Status status = mSource->signalEndOfInputStream();
+        status_t err = OK;
+        if (status.isOk()) {
+            return OK;
+        } else if ((err = status.serviceSpecificErrorCode()) != OK) {
+            return err;
+        } else if ((err = status.transactionError()) != OK) {
+            return err;
+        } else {
+            return UNKNOWN_ERROR;
+        }
+    }
+
 private:
     sp<BGraphicBufferSource> mSource;
     sp<C2OMXNode> mNode;
@@ -243,11 +234,77 @@ private:
 
 }  // namespace
 
+// CCodec::ClientListener
+
+struct CCodec::ClientListener : public Codec2Client::Listener {
+
+    explicit ClientListener(const wp<CCodec> &codec) : mCodec(codec) {}
+
+    virtual void onWorkDone(
+            const std::weak_ptr<Codec2Client::Component>& component,
+            std::list<std::unique_ptr<C2Work>>& workItems) override {
+        (void)component;
+        sp<CCodec> codec(mCodec.promote());
+        if (!codec) {
+            return;
+        }
+        codec->onWorkDone(workItems);
+    }
+
+    virtual void onTripped(
+            const std::weak_ptr<Codec2Client::Component>& component,
+            const std::vector<std::shared_ptr<C2SettingResult>>& settingResult
+            ) override {
+        // TODO
+        (void)component;
+        (void)settingResult;
+    }
+
+    virtual void onError(
+            const std::weak_ptr<Codec2Client::Component>& component,
+            uint32_t errorCode) override {
+        // TODO
+        (void)component;
+        (void)errorCode;
+    }
+
+    virtual void onDeath(
+            const std::weak_ptr<Codec2Client::Component>& component) override {
+        { // Log the death of the component.
+            std::shared_ptr<Codec2Client::Component> comp = component.lock();
+            if (!comp) {
+                ALOGE("Codec2 component died.");
+            } else {
+                ALOGE("Codec2 component \"%s\" died.", comp->getName().c_str());
+            }
+        }
+
+        // Report to MediaCodec.
+        sp<CCodec> codec(mCodec.promote());
+        if (!codec || !codec->mCallback) {
+            return;
+        }
+        codec->mCallback->onError(DEAD_OBJECT, ACTION_CODE_FATAL);
+    }
+
+    virtual void onFramesRendered(
+            const std::vector<RenderedFrame>& renderedFrames) override {
+        // TODO
+        (void)renderedFrames;
+    }
+
+private:
+    wp<CCodec> mCodec;
+};
+
+// CCodec
+
 CCodec::CCodec()
     : mChannel(new CCodecBufferChannel([this] (status_t err, enum ActionCode actionCode) {
           mCallback->onError(err, actionCode);
       })) {
     CCodecWatchdog::getInstance()->registerCodec(this);
+    initializeStandardParams();
 }
 
 CCodec::~CCodec() {
@@ -293,14 +350,14 @@ void CCodec::allocate(const sp<MediaCodecInfo> &codecInfo) {
         return;
     }
     ALOGV("allocate(%s)", codecInfo->getCodecName());
-    mListener.reset(new CCodecListener(this));
+    mClientListener.reset(new ClientListener(this));
 
     AString componentName = codecInfo->getCodecName();
     std::shared_ptr<Codec2Client> client;
     std::shared_ptr<Codec2Client::Component> comp =
             Codec2Client::CreateComponentByName(
             componentName.c_str(),
-            mListener,
+            mClientListener,
             &client);
     if (!comp) {
         ALOGE("Failed Create component: %s", componentName.c_str());
@@ -381,6 +438,17 @@ void CCodec::configure(const sp<AMessage> &msg) {
             encoder = false;
         }
 
+        int32_t storeMeta;
+        if (encoder
+                && msg->findInt32("android._input-metadata-buffer-type", &storeMeta)
+                && storeMeta != kMetadataBufferTypeInvalid) {
+            if (storeMeta != kMetadataBufferTypeANWBuffer) {
+                ALOGD("Only ANW buffers are supported for legacy metadata mode");
+                return BAD_VALUE;
+            }
+            mChannel->setMetaMode(CCodecBufferChannel::MODE_ANW);
+        }
+
         // TODO: read from intf()
         if ((!encoder) != (comp->getName().find("encoder") == std::string::npos)) {
             return UNKNOWN_ERROR;
@@ -393,49 +461,67 @@ void CCodec::configure(const sp<AMessage> &msg) {
         }
 
         std::vector<std::unique_ptr<C2Param>> params;
+        C2StreamUsageTuning::input usage(0u);
         std::initializer_list<C2Param::Index> indices {
             C2PortMimeConfig::input::PARAM_TYPE,
             C2PortMimeConfig::output::PARAM_TYPE,
         };
         c2err = comp->query(
-                {},
+                {&usage},
                 indices,
                 C2_DONT_BLOCK,
                 &params);
-        if (c2err != C2_OK) {
+        if (c2err != C2_OK && c2err != C2_BAD_INDEX) {
             ALOGE("Failed to query component interface: %d", c2err);
             return UNKNOWN_ERROR;
         }
         if (params.size() != indices.size()) {
-            ALOGE("Component returns wrong number of params");
+            ALOGE("Component returns wrong number of params: expected %zu actual %zu",
+                    indices.size(), params.size());
             return UNKNOWN_ERROR;
         }
         if (!params[0] || !params[1]) {
             ALOGE("Component returns null params");
             return UNKNOWN_ERROR;
         }
+        if (!*params[0] || !*params[1]) {
+            ALOGE("Component returns invalid params");
+            return UNKNOWN_ERROR;
+        }
         inputFormat->setString("mime", ((C2PortMimeConfig *)params[0].get())->m.value);
         outputFormat->setString("mime", ((C2PortMimeConfig *)params[1].get())->m.value);
+        if (usage && (usage.value & C2MemoryUsage::CPU_READ)) {
+            inputFormat->setInt32("using-sw-read-often", true);
+        }
 
         // XXX: hack
         bool audio = mime.startsWithIgnoreCase("audio/");
         if (!audio) {
-            int32_t tmp;
-            if (msg->findInt32("width", &tmp)) {
-                outputFormat->setInt32("width", tmp);
-            }
-            if (msg->findInt32("height", &tmp)) {
-                outputFormat->setInt32("height", tmp);
+            int32_t width, height;
+            if (msg->findInt32("width", &width) && msg->findInt32("height", &height)) {
+                inputFormat->setInt32("width", width);
+                inputFormat->setInt32("height", height);
+                inputFormat->setRect("crop", 0, 0, width - 1, height - 1);
+                outputFormat->setInt32("width", width);
+                outputFormat->setInt32("height", height);
+                outputFormat->setRect("crop", 0, 0, width - 1, height - 1);
             }
         } else {
-            if (encoder) {
-                inputFormat->setInt32("channel-count", 1);
-                inputFormat->setInt32("sample-rate", 44100);
-                outputFormat->setInt32("channel-count", 1);
-                outputFormat->setInt32("sample-rate", 44100);
-            } else {
-                outputFormat->setInt32("channel-count", 2);
-                outputFormat->setInt32("sample-rate", 44100);
+            int32_t channelCount, sampleRate;
+            if (msg->findInt32("channel-count", &channelCount)
+                    && msg->findInt32("sample-rate", &sampleRate)) {
+                inputFormat->setInt32("channel-count", channelCount);
+                inputFormat->setInt32("sample-rate", sampleRate);
+                outputFormat->setInt32("channel-count", channelCount);
+                outputFormat->setInt32("sample-rate", sampleRate);
+            }
+        }
+
+        // TODO: do this based on component requiring linear allocator for input
+        if (!encoder || audio) {
+            int32_t tmp;
+            if (msg->findInt32("max-input-size", &tmp)) {
+                inputFormat->setInt32(C2_NAME_STREAM_MAX_BUFFER_SIZE_SETTING, tmp);
             }
         }
 
@@ -485,42 +571,9 @@ void CCodec::initiateCreateInputSurface() {
 }
 
 void CCodec::createInputSurface() {
-    using namespace ::android::hardware::media::omx::V1_0;
-    sp<IOmx> tOmx = IOmx::getService("default");
-    if (tOmx == nullptr) {
-        ALOGE("Failed to create input surface");
-        mCallback->onInputSurfaceCreationFailed(UNKNOWN_ERROR);
-        return;
-    }
-    sp<IOMX> omx = new utils::LWOmx(tOmx);
-
+    status_t err;
     sp<IGraphicBufferProducer> bufferProducer;
-    sp<BGraphicBufferSource> bufferSource;
-    status_t err = omx->createInputSurface(&bufferProducer, &bufferSource);
 
-    if (err != OK) {
-        ALOGE("Failed to create input surface: %d", err);
-        mCallback->onInputSurfaceCreationFailed(err);
-        return;
-    }
-
-#if 0
-    std::shared_ptr<Codec2Client::InputSurface> surface;
-
-    status_t err = static_cast<status_t>(mClient->createInputSurface(&surface));
-    if (err != OK) {
-        ALOGE("Failed to create input surface: %d", static_cast<int>(err));
-        mCallback->onInputSurfaceCreationFailed(err);
-        return;
-    }
-    if (!surface) {
-        ALOGE("Failed to create input surface: null input surface");
-        mCallback->onInputSurfaceCreationFailed(UNKNOWN_ERROR);
-        return;
-    }
-#endif
-
-//    err = setupInputSurface(std::make_shared<C2InputSurfaceWrapper>(surface));
     sp<AMessage> inputFormat;
     sp<AMessage> outputFormat;
     {
@@ -528,12 +581,50 @@ void CCodec::createInputSurface() {
         inputFormat = formats->inputFormat;
         outputFormat = formats->outputFormat;
     }
-    int32_t width = 0;
-    (void)outputFormat->findInt32("width", &width);
-    int32_t height = 0;
-    (void)outputFormat->findInt32("height", &height);
-    err = setupInputSurface(std::make_shared<GraphicBufferSourceWrapper>(
-            bufferSource, width, height));
+
+    // TODO: Remove this property check and assume it's always true.
+    if (property_get_bool("debug.stagefright.c2inputsurface", false)) {
+        std::shared_ptr<Codec2Client::InputSurface> surface;
+
+        err = static_cast<status_t>(mClient->createInputSurface(&surface));
+        if (err != OK) {
+            ALOGE("Failed to create input surface: %d", static_cast<int>(err));
+            mCallback->onInputSurfaceCreationFailed(err);
+            return;
+        }
+        if (!surface) {
+            ALOGE("Failed to create input surface: null input surface");
+            mCallback->onInputSurfaceCreationFailed(UNKNOWN_ERROR);
+            return;
+        }
+        bufferProducer = surface->getGraphicBufferProducer();
+        err = setupInputSurface(std::make_shared<C2InputSurfaceWrapper>(surface));
+    } else { // TODO: Remove this block.
+        using namespace ::android::hardware::media::omx::V1_0;
+        sp<IOmx> tOmx = IOmx::getService("default");
+        if (tOmx == nullptr) {
+            ALOGE("Failed to create input surface");
+            mCallback->onInputSurfaceCreationFailed(UNKNOWN_ERROR);
+            return;
+        }
+        sp<IOMX> omx = new utils::LWOmx(tOmx);
+
+        sp<BGraphicBufferSource> bufferSource;
+        err = omx->createInputSurface(&bufferProducer, &bufferSource);
+
+        if (err != OK) {
+            ALOGE("Failed to create input surface: %d", err);
+            mCallback->onInputSurfaceCreationFailed(err);
+            return;
+        }
+        int32_t width = 0;
+        (void)outputFormat->findInt32("width", &width);
+        int32_t height = 0;
+        (void)outputFormat->findInt32("height", &height);
+        err = setupInputSurface(std::make_shared<GraphicBufferSourceWrapper>(
+                bufferSource, width, height));
+    }
+
     if (err != OK) {
         ALOGE("Failed to set up input surface: %d", err);
         mCallback->onInputSurfaceCreationFailed(err);
@@ -857,12 +948,90 @@ void CCodec::signalSetParameters(const sp<AMessage> &params) {
     msg->post();
 }
 
-void CCodec::setParameters(const sp<AMessage> &params) {
-    class MyParam : public C2Param {
-    public:
-        inline MyParam(uint32_t size, Index index) : C2Param(size, index) {}
-    };
+void CCodec::initializeStandardParams() {
+    mStandardParams.emplace("bitrate",          "coded.bitrate.value");
+    mStandardParams.emplace("video-bitrate",    "coded.bitrate.value");
+    mStandardParams.emplace("bitrate-mode",     "coded.bitrate-mode.value");
+    mStandardParams.emplace("frame-rate",       "coded.frame-rate.value");
+    mStandardParams.emplace("max-input-size",   "coded.max-frame-size.value");
+    mStandardParams.emplace("rotation-degrees", "coded.vui.rotation.value");
 
+    mStandardParams.emplace("prepend-sps-pps-to-idr-frames", "coding.add-csd-to-sync-frames.value");
+    mStandardParams.emplace("i-frame-period",   "coding.gop.intra-period");
+    mStandardParams.emplace("intra-refresh-period", "coding.intra-refresh.period");
+    mStandardParams.emplace("quality",          "coding.quality.value");
+    mStandardParams.emplace("request-sync",     "coding.request-sync.value");
+
+    mStandardParams.emplace("operating-rate",   "ctrl.operating-rate.value");
+    mStandardParams.emplace("priority",         "ctrl.priority.value");
+
+    mStandardParams.emplace("channel-count",    "raw.channel-count.value");
+    mStandardParams.emplace("max-width",        "raw.max-size.width");
+    mStandardParams.emplace("max-height",       "raw.max-size.height");
+    mStandardParams.emplace("pcm-encoding",     "raw.pcm-encoding.value");
+    mStandardParams.emplace("color-format",     "raw.pixel-format.value");
+    mStandardParams.emplace("sample-rate",      "raw.sample-rate.value");
+    mStandardParams.emplace("width",            "raw.size.width");
+    mStandardParams.emplace("height",           "raw.size.height");
+
+    mStandardParams.emplace("is-adts",          "coded.aac-stream-format.value");
+
+    // mStandardParams.emplace("stride", "raw.??");
+    // mStandardParams.emplace("slice-height", "raw.??");
+}
+
+sp<AMessage> CCodec::filterParameters(const sp<AMessage> &params) const {
+    sp<AMessage> filtered = params->dup();
+
+    // TODO: some params may require recalculation or a type fix
+    // e.g. i-frame-interval here
+    {
+        int32_t frameRateInt;
+        if (filtered->findInt32("frame-rate", &frameRateInt)) {
+            filtered->removeEntryAt(filtered->findEntryByName("frame-rate"));
+            filtered->setFloat("frame-rate", frameRateInt);
+        }
+    }
+
+    {
+        float frameRate;
+        int32_t iFrameInterval;
+        if (filtered->findInt32("i-frame-interval", &iFrameInterval)
+                && filtered->findFloat("frame-rate", &frameRate)) {
+            filtered->setInt32("i-frame-period", iFrameInterval * frameRate + 0.5);
+        }
+    }
+
+    {
+        int32_t isAdts;
+        if (filtered->findInt32("is-adts", &isAdts)) {
+            filtered->setInt32(
+                    "is-adts",
+                    isAdts ? C2AacStreamFormatAdts : C2AacStreamFormatRaw);
+        }
+    }
+
+    for (size_t ix = 0; ix < filtered->countEntries();) {
+        AMessage::Type type;
+        AString name = filtered->getEntryNameAt(ix, &type);
+        if (name.startsWith("vendor.")) {
+            // vendor params pass through as is
+            ++ix;
+            continue;
+        }
+        auto it = mStandardParams.find(name.c_str());
+        if (it == mStandardParams.end()) {
+            // non-standard parameters are filtered out
+            filtered->removeEntryAt(ix);
+            continue;
+        }
+        filtered->setEntryNameAt(ix++, it->second.c_str());
+    }
+    ALOGV("filtered %s to %s", params->debugString(4).c_str(), filtered->debugString(4).c_str());
+    return filtered;
+}
+
+void CCodec::setParameters(const sp<AMessage> &unfiltered) {
     std::shared_ptr<Codec2Client::Component> comp;
     auto checkState = [this, &comp] {
         Mutexed<State>::Locked state(mState);
@@ -876,7 +1045,7 @@ void CCodec::setParameters(const sp<AMessage> &params) {
         return;
     }
 
-    // TODO: ACodec backward-compatibility
+    sp<AMessage> params = filterParameters(unfiltered);
 
     c2_status_t err = C2_OK;
     std::vector<std::unique_ptr<C2Param>> vec;
@@ -914,8 +1083,7 @@ void CCodec::setParameters(const sp<AMessage> &params) {
 }
 
 void CCodec::signalEndOfInputStream() {
-    // TODO
-    mCallback->onSignaledInputEOS(INVALID_OPERATION);
+    mCallback->onSignaledInputEOS(mChannel->signalEndOfInputStream());
 }
 
 void CCodec::signalRequestIDRFrame() {
@@ -1001,7 +1169,7 @@ void CCodec::onMessageReceived(const sp<AMessage> &msg) {
                     (new AMessage(kWhatWorkDone, this))->post();
                 }
             }
-            mChannel->onWorkDone(work);
+            mChannel->onWorkDone(std::move(work));
             break;
         }
         default: {

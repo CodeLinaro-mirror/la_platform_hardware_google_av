@@ -446,7 +446,7 @@ public:
     // otherwise, do not copy anything, and return false.
     inline bool updateFrom(const C2Param &other) {
         if (other._mSize <= _mSize && other._mIndex == _mIndex && _mSize > 0) {
-            memcpy(this, &other, _mSize);
+            memcpy(this, &other, other._mSize);
             return true;
         }
         return false;
@@ -620,6 +620,7 @@ struct _C2FieldId {
 
 private:
     friend struct _C2ParamInspector;
+    friend struct C2FieldDescriptor;
 
     uint32_t _mOffset; // offset of field
     uint32_t _mSize;   // size of field
@@ -661,6 +662,9 @@ struct C2ParamField {
      *
      * \todo fix what this is for T[] (for now size becomes T[1])
      *
+     * \note this does not work for 64-bit members as it triggers a
+     * 'taking address of packed member' warning.
+     *
      * \param param pointer to parameter
      * \param offset member pointer
      */
@@ -668,6 +672,11 @@ struct C2ParamField {
     inline C2ParamField(S* param, T* offset)
         : _mIndex(param->index()),
           _mFieldId((T*)((uintptr_t)offset - (uintptr_t)param)) {}
+
+    template<typename S, typename T>
+    inline static C2ParamField Make(S& param, T& offset) {
+        return C2ParamField(param.index(), (uintptr_t)&offset - (uintptr_t)&param, sizeof(T));
+    }
 
     /**
      * Create a field identifier using a configuration parameter (variable),
@@ -757,7 +766,14 @@ public:
         Primitive(uint32_t value)    : u32(value) { }
         Primitive(int32_t value)     : i32(value) { }
         Primitive(c2_cntr32_t value) : c32(value) { }
+        Primitive(uint8_t value)     : u32(value) { }
+        Primitive(char value)        : i32(value) { }
         Primitive(float value)       : fp(value)  { }
+
+        // allow construction from enum type
+        template<typename E, typename = typename std::enable_if<std::is_enum<E>::value>::type>
+        Primitive(E value)
+            : Primitive(static_cast<typename std::underlying_type<E>::type>(value)) { }
 
         Primitive() : u64(0) { }
 
@@ -780,7 +796,11 @@ public:
         FLOAT,
     };
 
-    template<typename T> static constexpr type_t typeFor();
+    template<typename T, bool = std::is_enum<T>::value>
+    inline static constexpr type_t typeFor() {
+        using U = typename std::underlying_type<T>::type;
+        return typeFor<U>();
+    }
 
     // constructors - implicit
     template<typename T>
@@ -812,13 +832,19 @@ template<> inline const c2_cntr32_t &C2Value::Primitive::ref<c2_cntr32_t>() cons
 template<> inline const c2_cntr64_t &C2Value::Primitive::ref<c2_cntr64_t>() const { return c64; }
 template<> inline const float &C2Value::Primitive::ref<float>() const { return fp; }
 
-template<> constexpr C2Value::type_t C2Value::typeFor<int32_t>() { return INT32; }
-template<> constexpr C2Value::type_t C2Value::typeFor<int64_t>() { return INT64; }
-template<> constexpr C2Value::type_t C2Value::typeFor<uint32_t>() { return UINT32; }
-template<> constexpr C2Value::type_t C2Value::typeFor<uint64_t>() { return UINT64; }
-template<> constexpr C2Value::type_t C2Value::typeFor<c2_cntr32_t>() { return CNTR32; }
-template<> constexpr C2Value::type_t C2Value::typeFor<c2_cntr64_t>() { return CNTR64; }
-template<> constexpr C2Value::type_t C2Value::typeFor<float>() { return FLOAT; }
+// provide types for enums and uint8_t, char even though we don't provide reading as them
+template<> constexpr C2Value::type_t C2Value::typeFor<char, false>() { return INT32; }
+template<> constexpr C2Value::type_t C2Value::typeFor<int32_t, false>() { return INT32; }
+template<> constexpr C2Value::type_t C2Value::typeFor<int64_t, false>() { return INT64; }
+template<> constexpr C2Value::type_t C2Value::typeFor<uint8_t, false>() { return UINT32; }
+template<> constexpr C2Value::type_t C2Value::typeFor<uint32_t, false>() { return UINT32; }
+template<> constexpr C2Value::type_t C2Value::typeFor<uint64_t, false>() { return UINT64; }
+template<> constexpr C2Value::type_t C2Value::typeFor<c2_cntr32_t, false>() { return CNTR32; }
+template<> constexpr C2Value::type_t C2Value::typeFor<c2_cntr64_t, false>() { return CNTR64; }
+template<> constexpr C2Value::type_t C2Value::typeFor<float, false>() { return FLOAT; }
+
+// forward declare easy enum template
+template<typename E> struct C2EasyEnum;
 
 /**
  * field descriptor. A field is uniquely defined by an index into a parameter.
@@ -866,15 +892,28 @@ struct C2FieldDescriptor {
     template<typename B>
     static NamedValuesType namedValuesFor(const B &);
 
+    /** specialization for easy enums */
+    template<typename E>
+    inline static NamedValuesType namedValuesFor(const C2EasyEnum<E> &) {
+        return namedValuesFor(*(E*)nullptr);
+    }
+
+private:
+    template<typename B, bool enabled=std::is_arithmetic<B>::value || std::is_enum<B>::value>
+    struct C2_HIDE _NamedValuesGetter;
+
+public:
     inline C2FieldDescriptor(uint32_t type, uint32_t extent, C2String name, size_t offset, size_t size)
         : _mType((type_t)type), _mExtent(extent), _mName(name), _mFieldId(offset, size) { }
+
+    inline C2FieldDescriptor(const C2FieldDescriptor &) = default;
 
     template<typename T, class B=typename std::remove_extent<T>::type>
     inline C2FieldDescriptor(const T* offset, const char *name)
         : _mType(this->GetType((B*)nullptr)),
           _mExtent(std::is_array<T>::value ? std::extent<T>::value : 1),
           _mName(name),
-          _mNamedValues(namedValuesFor(*(B*)0)),
+          _mNamedValues(_NamedValuesGetter<B>::getNamedValues()),
           _mFieldId(offset) {}
 
 /*
@@ -911,6 +950,14 @@ struct C2FieldDescriptor {
 #endif
 
 private:
+    /**
+     * Construct an offseted field descriptor.
+     */
+    inline C2FieldDescriptor(const C2FieldDescriptor &desc, size_t offset)
+        : _mType(desc._mType), _mExtent(desc._mExtent),
+          _mName(desc._mName), _mNamedValues(desc._mNamedValues),
+          _mFieldId(desc._mFieldId._mOffset + offset, desc._mFieldId._mSize) { }
+
     type_t _mType;
     uint32_t _mExtent; // the last member can be arbitrary length if it is T[] array,
                        // extending to the end of the parameter (this is marked with
@@ -951,6 +998,21 @@ private:
     }
 
     friend struct _C2ParamInspector;
+};
+
+// no named values for compound types
+template<typename B>
+struct C2FieldDescriptor::_NamedValuesGetter<B, false> {
+    inline static C2FieldDescriptor::NamedValuesType getNamedValues() {
+        return NamedValuesType();
+    }
+};
+
+template<typename B>
+struct C2FieldDescriptor::_NamedValuesGetter<B, true> {
+    inline static C2FieldDescriptor::NamedValuesType getNamedValues() {
+        return C2FieldDescriptor::namedValuesFor(*(B*)nullptr);
+    }
 };
 
 #define DEFINE_NO_NAMED_VALUES_FOR(type) \

@@ -17,14 +17,18 @@
 #ifndef CODEC2_HIDL_CLIENT_H_
 #define CODEC2_HIDL_CLIENT_H_
 
+#include <codec2/hidl/1.0/types.h>
+
 #include <C2PlatformSupport.h>
 #include <C2Component.h>
 #include <C2Buffer.h>
 #include <C2Param.h>
 #include <C2.h>
 
+#include <hidl/HidlSupport.h>
 #include <utils/StrongPointer.h>
 
+#include <map>
 #include <memory>
 #include <mutex>
 
@@ -74,6 +78,18 @@ struct IInputSurfaceConnection;
 } // namespace media
 } // namespace google
 } // namespace hardware
+
+namespace android {
+namespace hardware {
+namespace media {
+namespace bufferpool {
+namespace V1_0 {
+struct IClientManager;
+} // namespace V1_0
+} // namespace bufferpool
+} // namespace media
+} // namespace hardware
+} // namespace android
 
 // Forward declarations of other classes
 namespace android {
@@ -193,13 +209,16 @@ struct Codec2Client : public Codec2ConfigurableClient {
     Codec2Client(const sp<Base>& base);
 
 protected:
+    Base* base() const;
+
     mutable std::mutex mMutex;
     mutable bool mListed;
     mutable std::vector<C2Component::Traits> mTraitsList;
     mutable std::vector<std::unique_ptr<std::vector<std::string>>>
             mAliasesBuffer;
 
-    Base* base() const;
+    sp<::android::hardware::media::bufferpool::V1_0::IClientManager>
+            mHostPoolManager;
 };
 
 struct Codec2Client::Listener {
@@ -217,6 +236,18 @@ struct Codec2Client::Listener {
             const std::weak_ptr<Component>& comp,
             uint32_t errorCode) = 0;
 
+    virtual void onDeath(
+            const std::weak_ptr<Component>& comp) = 0;
+
+    struct RenderedFrame {
+        uint64_t bufferQueueId;
+        int32_t slotId;
+        int64_t timestampNs;
+    };
+
+    virtual void onFramesRendered(
+            const std::vector<RenderedFrame>& renderedFrames) = 0;
+
     virtual ~Listener();
 
 };
@@ -227,8 +258,11 @@ struct Codec2Client::Component : public Codec2Client::Configurable {
 
     c2_status_t createBlockPool(
             C2Allocator::id_t id,
-            C2BlockPool::local_id_t* localId,
+            C2BlockPool::local_id_t* blockPoolId,
             std::shared_ptr<Configurable>* configurable);
+
+    c2_status_t destroyBlockPool(
+            C2BlockPool::local_id_t localId);
 
     c2_status_t queue(
             std::list<std::unique_ptr<C2Work>>* const items);
@@ -253,11 +287,9 @@ struct Codec2Client::Component : public Codec2Client::Configurable {
             IGraphicBufferSource IGraphicBufferSource;
 
     // Output surface
-    c2_status_t setOutputSurface(const sp<IGraphicBufferProducer>& surface);
-
-    // Input surface
-    c2_status_t connectToInputSurface(
-            const std::shared_ptr<InputSurface>& surface);
+    c2_status_t setOutputSurface(
+            C2BlockPool::local_id_t blockPoolId,
+            const sp<IGraphicBufferProducer>& surface);
 
     c2_status_t connectToOmxInputSurface(
             const sp<IGraphicBufferProducer>& producer,
@@ -265,20 +297,28 @@ struct Codec2Client::Component : public Codec2Client::Configurable {
 
     c2_status_t disconnectFromInputSurface();
 
-    // Platform BlockPool support
-    c2_status_t getLocalBlockPool(
-            C2BlockPool::local_id_t id,
-            std::shared_ptr<C2BlockPool>* pool) const;
-
-    c2_status_t createLocalBlockPool(
-            C2PlatformAllocatorStore::id_t allocatorId,
-            std::shared_ptr<C2BlockPool>* pool) const;
+    // Input buffer lifetime management
+    void handleOnWorkDone(const std::vector<uint64_t> &inputDone);
 
     // base cannot be null.
     Component(const sp<Base>& base);
 
+    ~Component();
+
 protected:
     Base* base() const;
+
+    mutable std::mutex mInputBuffersMutex;
+    mutable std::map<uint64_t, std::vector<std::shared_ptr<C2Buffer>>>
+            mInputBuffers;
+
+    ::hardware::google::media::c2::V1_0::utils::DefaultBufferPoolSender
+            mBufferPoolSender;
+
+    static c2_status_t setDeathListener(
+            const std::shared_ptr<Component>& component,
+            const std::shared_ptr<Listener>& listener);
+    sp<::android::hardware::hidl_death_recipient> mDeathRecipient;
 
     friend struct Codec2Client;
 };
@@ -306,10 +346,10 @@ public:
     InputSurface(const sp<Base>& base);
 
 protected:
-    sp<Base> mBase;
-    sp<IGraphicBufferProducer> mGraphicBufferProducer;
-
     Base* base() const;
+    sp<Base> mBase;
+
+    sp<IGraphicBufferProducer> mGraphicBufferProducer;
 
     friend struct Codec2Client;
     friend struct Component;
@@ -325,9 +365,8 @@ struct Codec2Client::InputSurfaceConnection {
     InputSurfaceConnection(const sp<Base>& base);
 
 protected:
-    sp<Base> mBase;
-
     Base* base() const;
+    sp<Base> mBase;
 
     friend struct Codec2Client::InputSurface;
 };

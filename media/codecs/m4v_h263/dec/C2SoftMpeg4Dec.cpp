@@ -15,13 +15,17 @@
  */
 
 #define LOG_NDEBUG 0
-#define LOG_TAG "C2SoftMpeg4Dec"
+#ifdef MPEG4
+  #define LOG_TAG "C2SoftMpeg4Dec"
+#else
+  #define LOG_TAG "C2SoftH263Dec"
+#endif
 #include <utils/Log.h>
 
 #include "C2SoftMpeg4Dec.h"
 
 #include <C2PlatformSupport.h>
-#include <SimpleC2Interface.h>
+#include <SimpleInterfaceCommon.h>
 
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AUtils.h>
@@ -32,33 +36,84 @@
 namespace android {
 
 #ifdef MPEG4
-constexpr char kComponentName[] = "c2.google.mpeg4.decoder";
+constexpr char COMPONENT_NAME[] = "c2.android.mpeg4.decoder";
 #else
-constexpr char kComponentName[] = "c2.google.h263.decoder";
+constexpr char COMPONENT_NAME[] = "c2.android.h263.decoder";
 #endif
 
-static std::shared_ptr<C2ComponentInterface> BuildIntf(
-        const char *name, c2_node_id_t id,
-        std::function<void(C2ComponentInterface*)> deleter =
-            std::default_delete<C2ComponentInterface>()) {
-    return SimpleC2Interface::Builder(name, id, deleter)
-            .inputFormat(C2FormatCompressed)
-            .outputFormat(C2FormatVideo)
-            .inputMediaType(
+class C2SoftMpeg4Dec::IntfImpl : public C2InterfaceHelper {
+public:
+    explicit IntfImpl(const std::shared_ptr<C2ReflectorHelper> &helper)
+        : C2InterfaceHelper(helper) {
+
+        setDerivedInstance(this);
+
+        addParameter(
+                DefineParam(mInputFormat, C2_NAME_INPUT_STREAM_FORMAT_SETTING)
+                .withConstValue(new C2StreamFormatConfig::input(0u, C2FormatCompressed))
+                .build());
+
+        addParameter(
+                DefineParam(mOutputFormat, C2_NAME_OUTPUT_STREAM_FORMAT_SETTING)
+                .withConstValue(new C2StreamFormatConfig::output(0u, C2FormatVideo))
+                .build());
+
+        addParameter(
+                DefineParam(mInputMediaType, C2_NAME_INPUT_PORT_MIME_SETTING)
+                .withConstValue(AllocSharedString<C2PortMimeConfig::input>(
 #ifdef MPEG4
-                    MEDIA_MIMETYPE_VIDEO_MPEG4
+                        MEDIA_MIMETYPE_VIDEO_MPEG4
 #else
-                    MEDIA_MIMETYPE_VIDEO_H263
+                        MEDIA_MIMETYPE_VIDEO_H263
 #endif
-            )
-            .outputMediaType(MEDIA_MIMETYPE_VIDEO_RAW)
-            .build();
-}
+                )).build());
 
-C2SoftMpeg4Dec::C2SoftMpeg4Dec(const char *name, c2_node_id_t id)
-    : SimpleC2Component(BuildIntf(name, id)),
+        addParameter(
+                DefineParam(mOutputMediaType, C2_NAME_OUTPUT_PORT_MIME_SETTING)
+                .withConstValue(AllocSharedString<C2PortMimeConfig::output>(
+                        MEDIA_MIMETYPE_VIDEO_RAW))
+                .build());
+
+        addParameter(
+            DefineParam(mSize, C2_NAME_STREAM_VIDEO_SIZE_INFO)
+                .withDefault(new C2VideoSizeStreamInfo::output(0u, 176, 144))
+                .withFields({
+#ifdef MPEG4
+                    C2F(mSize, width).inRange(16, 352, 2),
+                    C2F(mSize, height).inRange(16, 288, 2),
+#else
+                    C2F(mSize, width).inRange(16, 352, 16),
+                    C2F(mSize, height).inRange(16, 288, 16),
+#endif
+                })
+                .withSetter(SizeSetter)
+                .build());
+    }
+
+    static C2R SizeSetter(bool mayBlock, C2P<C2VideoSizeStreamInfo::output> &me) {
+        (void)mayBlock;
+        // TODO: maybe apply block limit?
+        return me.F(me.v.width).validatePossible(me.v.width).plus(
+                me.F(me.v.height).validatePossible(me.v.height));
+    }
+
+private:
+    std::shared_ptr<C2StreamFormatConfig::input> mInputFormat;
+    std::shared_ptr<C2StreamFormatConfig::output> mOutputFormat;
+    std::shared_ptr<C2PortMimeConfig::input> mInputMediaType;
+    std::shared_ptr<C2PortMimeConfig::output> mOutputMediaType;
+    std::shared_ptr<C2VideoSizeStreamInfo::output> mSize;
+};
+
+C2SoftMpeg4Dec::C2SoftMpeg4Dec(
+        const char *name,
+        c2_node_id_t id,
+        const std::shared_ptr<IntfImpl> &intfImpl)
+    : SimpleC2Component(std::make_shared<SimpleInterface<IntfImpl>>(name, id, intfImpl)),
+      mIntf(intfImpl),
       mDecHandle(nullptr),
-      mOutputBuffer{} {
+      mOutputBuffer{},
+      mInitialized(false) {
 }
 
 C2SoftMpeg4Dec::~C2SoftMpeg4Dec() {
@@ -72,7 +127,9 @@ c2_status_t C2SoftMpeg4Dec::onInit() {
 
 c2_status_t C2SoftMpeg4Dec::onStop() {
     if (mInitialized) {
-        PVCleanUpVideoDecoder(mDecHandle);
+        if (mDecHandle) {
+            PVCleanUpVideoDecoder(mDecHandle);
+        }
         mInitialized = false;
     }
     for (int32_t i = 0; i < kNumOutputBuffers; ++i) {
@@ -90,12 +147,17 @@ c2_status_t C2SoftMpeg4Dec::onStop() {
 }
 
 void C2SoftMpeg4Dec::onReset() {
-    (void) onStop();
+    (void)onStop();
+    (void)onInit();
 }
 
 void C2SoftMpeg4Dec::onRelease() {
     if (mInitialized) {
-        PVCleanUpVideoDecoder(mDecHandle);
+        if (mDecHandle) {
+            PVCleanUpVideoDecoder(mDecHandle);
+            delete mDecHandle;
+            mDecHandle = nullptr;
+        }
         mInitialized = false;
     }
     if (mOutBlock) {
@@ -107,14 +169,13 @@ void C2SoftMpeg4Dec::onRelease() {
             mOutputBuffer[i] = nullptr;
         }
     }
-
-    delete mDecHandle;
-    mDecHandle = nullptr;
 }
 
 c2_status_t C2SoftMpeg4Dec::onFlush_sm() {
     if (mInitialized) {
-        if (PV_TRUE != PVResetVideoDecoder(mDecHandle)) return C2_CORRUPTED;
+        if (PV_TRUE != PVResetVideoDecoder(mDecHandle)) {
+            return C2_CORRUPTED;
+        }
     }
     mSignalledOutputEos = false;
     mSignalledError = false;
@@ -195,7 +256,9 @@ c2_status_t C2SoftMpeg4Dec::ensureDecoderState(const std::shared_ptr<C2BlockPool
     for (int32_t i = 0; i < kNumOutputBuffers; ++i) {
         if (!mOutputBuffer[i]) {
             mOutputBuffer[i] = (uint8_t *)malloc(outSize * sizeof(uint8_t));
-            if (!mOutputBuffer[i]) return C2_NO_MEMORY;
+            if (!mOutputBuffer[i]) {
+                return C2_NO_MEMORY;
+            }
         }
     }
     if (mOutBlock &&
@@ -297,6 +360,7 @@ void C2SoftMpeg4Dec::process(
         const std::shared_ptr<C2BlockPool> &pool) {
     work->result = C2_OK;
     work->workletsProcessed = 0u;
+    work->worklets.front()->output.configUpdate.clear();
     if (mSignalledError || mSignalledOutputEos) {
         work->result = C2_BAD_VALUE;
         return;
@@ -362,7 +426,21 @@ void C2SoftMpeg4Dec::process(
         }
 
         PVSetPostProcType(mDecHandle, 0);
-        (void) handleResChange(work);
+        if (handleResChange(work)) {
+            ALOGI("Setting width and height");
+            C2VideoSizeStreamInfo::output size(0u, mWidth, mHeight);
+            std::vector<std::unique_ptr<C2SettingResult>> failures;
+            c2_status_t err = mIntf->config({&size}, C2_MAY_BLOCK, &failures);
+            if (err == OK) {
+                work->worklets.front()->output.configUpdate.push_back(
+                    C2Param::Copy(size));
+            } else {
+                ALOGE("Config update size failed");
+                mSignalledError = true;
+                work->result = C2_CORRUPTED;
+                return;
+            }
+        }
         if (codecConfig) {
             fillEmptyWork(work);
             return;
@@ -422,6 +500,18 @@ void C2SoftMpeg4Dec::process(
             mSignalledError = true;
             return;
         } else if (resChange) {
+            ALOGI("Setting width and height");
+            C2VideoSizeStreamInfo::output size(0u, mWidth, mHeight);
+            std::vector<std::unique_ptr<C2SettingResult>> failures;
+            c2_status_t err = mIntf->config({&size}, C2_MAY_BLOCK, &failures);
+            if (err == OK) {
+                work->worklets.front()->output.configUpdate.push_back(C2Param::Copy(size));
+            } else {
+                ALOGE("Config update size failed");
+                mSignalledError = true;
+                work->result = C2_CORRUPTED;
+                return;
+            }
             continue;
         }
 
@@ -455,7 +545,7 @@ void C2SoftMpeg4Dec::process(
 c2_status_t C2SoftMpeg4Dec::drain(
         uint32_t drainMode,
         const std::shared_ptr<C2BlockPool> &pool) {
-    (void) pool;
+    (void)pool;
     if (drainMode == NO_DRAIN) {
         ALOGW("drain with NO_DRAIN: no-op");
         return C2_OK;
@@ -469,11 +559,19 @@ c2_status_t C2SoftMpeg4Dec::drain(
 
 class C2SoftMpeg4DecFactory : public C2ComponentFactory {
 public:
+    C2SoftMpeg4DecFactory() : mHelper(std::static_pointer_cast<C2ReflectorHelper>(
+        GetCodec2PlatformComponentStore()->getParamReflector())) {
+    }
+
     virtual c2_status_t createComponent(
             c2_node_id_t id,
             std::shared_ptr<C2Component>* const component,
             std::function<void(C2Component*)> deleter) override {
-        *component = std::shared_ptr<C2Component>(new C2SoftMpeg4Dec(kComponentName, id), deleter);
+        *component = std::shared_ptr<C2Component>(
+                new C2SoftMpeg4Dec(COMPONENT_NAME,
+                                   id,
+                                   std::make_shared<C2SoftMpeg4Dec::IntfImpl>(mHelper)),
+                deleter);
         return C2_OK;
     }
 
@@ -481,11 +579,17 @@ public:
             c2_node_id_t id,
             std::shared_ptr<C2ComponentInterface>* const interface,
             std::function<void(C2ComponentInterface*)> deleter) override {
-        *interface = BuildIntf(kComponentName, id, deleter);
+        *interface = std::shared_ptr<C2ComponentInterface>(
+                new SimpleInterface<C2SoftMpeg4Dec::IntfImpl>(
+                        COMPONENT_NAME, id, std::make_shared<C2SoftMpeg4Dec::IntfImpl>(mHelper)),
+                deleter);
         return C2_OK;
     }
 
     virtual ~C2SoftMpeg4DecFactory() override = default;
+
+private:
+    std::shared_ptr<C2ReflectorHelper> mHelper;
 };
 
 }  // namespace android

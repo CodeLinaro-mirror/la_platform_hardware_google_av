@@ -17,30 +17,37 @@
 #ifndef ANDROID_HARDWARE_MEDIA_BUFFERPOOL_V1_0_BUFFERPOOLTYPES_H
 #define ANDROID_HARDWARE_MEDIA_BUFFERPOOL_V1_0_BUFFERPOOLTYPES_H
 
+#include <android/hardware/media/bufferpool/1.0/IAccessor.h>
 #include <android/hardware/media/bufferpool/1.0/types.h>
 #include <cutils/native_handle.h>
 #include <fmq/MessageQueue.h>
 #include <hidl/MQDescriptor.h>
 #include <hidl/Status.h>
 
-struct __attribute__((visibility("hidden"))) _C2BlockPoolData {
-    uint32_t mId; //BufferId
-    // Handle should be copied to somewhere else, and should be managed there.
-    native_handle_t *mHandle;
-
-    _C2BlockPoolData() : mId(0), mHandle(NULL) {}
-
-    _C2BlockPoolData(uint32_t id, native_handle_t *handle)
-            : mId(id), mHandle(handle) {}
-
-    ~_C2BlockPoolData() {
-    }
-};
-
 namespace android {
 namespace hardware {
 namespace media {
 namespace bufferpool {
+
+struct BufferPoolData {
+    // For local use, to specify a bufferpool (client connection) for buffers.
+    // Return value from connect#IAccessor(android.hardware.media.bufferpool@1.0).
+    int64_t mConnectionId;
+    // BufferId
+    uint32_t mId;
+    // Accessor accosiated to the buffer.
+    wp<V1_0::IAccessor> mAccessor;
+
+    BufferPoolData() : mConnectionId(0), mId(0), mAccessor(nullptr) {}
+
+    BufferPoolData(
+            int64_t connectionId, uint32_t id,
+            wp<V1_0::IAccessor> accessor)
+            : mConnectionId(connectionId), mId(id), mAccessor(accessor) {}
+
+    ~BufferPoolData() {}
+};
+
 namespace V1_0 {
 namespace implementation {
 
@@ -49,6 +56,10 @@ using ::android::hardware::kSynchronizedReadWrite;
 typedef uint32_t BufferId;
 typedef uint64_t TransactionId;
 typedef int64_t ConnectionId;
+
+enum : ConnectionId {
+    INVALID_CONNECTIONID = 0,
+};
 
 typedef android::hardware::MessageQueue<BufferStatusMessage, kSynchronizedReadWrite> BufferStatusQueue;
 typedef BufferStatusQueue::Descriptor QueueDescriptor;
@@ -75,7 +86,7 @@ class BufferPoolAllocator {
 public:
 
     /**
-     * Allocate an allocation(buffer) for bufer pool.
+     * Allocate an allocation(buffer) for buffer pool.
      *
      * @param params    allocation parameters
      * @param alloc     created allocation
