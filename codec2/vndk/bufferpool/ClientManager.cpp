@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include <ClientManager.h>
+#include <bufferpool/ClientManager.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -43,17 +43,18 @@ public:
 
     ResultStatus allocate(ConnectionId connectionId,
                           const std::vector<uint8_t> &params,
-                          std::shared_ptr<_C2BlockPoolData> *buffer);
+                          native_handle_t **handle,
+                          std::shared_ptr<BufferPoolData> *buffer);
 
     ResultStatus receive(ConnectionId connectionId,
                          TransactionId transactionId,
                          BufferId bufferId,
                          int64_t timestampUs,
-                         std::shared_ptr<_C2BlockPoolData> *buffer);
+                         native_handle_t **handle,
+                         std::shared_ptr<BufferPoolData> *buffer);
 
-    ResultStatus postSend(ConnectionId connectionId,
-                          ConnectionId receiverId,
-                          const std::shared_ptr<_C2BlockPoolData> &buffer,
+    ResultStatus postSend(ConnectionId receiverId,
+                          const std::shared_ptr<BufferPoolData> &buffer,
                           TransactionId *transactionId,
                           int64_t *timestampUs);
 
@@ -62,10 +63,10 @@ public:
 
 private:
     // In order to prevent deadlock between multiple locks,
-    // Always lock ClientCache.lock before locking ActiveClients.lock.
+    // always lock ClientCache.lock before locking ActiveClients.lock.
     struct ClientCache {
         // This lock is held for brief duration.
-        // Blocking operation is not performed holding the lock.
+        // Blocking operation is not performed while holding the lock.
         std::mutex mMutex;
         std::map<const wp<IAccessor>, const std::weak_ptr<BufferPoolClient>>
                 mClients;
@@ -182,7 +183,7 @@ ResultStatus ClientManager::Impl::close(ConnectionId connectionId) {
 
 ResultStatus ClientManager::Impl::allocate(
         ConnectionId connectionId, const std::vector<uint8_t> &params,
-        std::shared_ptr<_C2BlockPoolData> *buffer) {
+        native_handle_t **handle, std::shared_ptr<BufferPoolData> *buffer) {
     std::shared_ptr<BufferPoolClient> client;
     {
         std::lock_guard<std::mutex> lock(mActive.mMutex);
@@ -192,13 +193,13 @@ ResultStatus ClientManager::Impl::allocate(
         }
         client = it->second;
     }
-    return client->allocate(params, buffer);
+    return client->allocate(params, handle, buffer);
 }
 
 ResultStatus ClientManager::Impl::receive(
         ConnectionId connectionId, TransactionId transactionId,
         BufferId bufferId, int64_t timestampUs,
-        std::shared_ptr<_C2BlockPoolData> *buffer) {
+        native_handle_t **handle, std::shared_ptr<BufferPoolData> *buffer) {
     std::shared_ptr<BufferPoolClient> client;
     {
         std::lock_guard<std::mutex> lock(mActive.mMutex);
@@ -208,13 +209,13 @@ ResultStatus ClientManager::Impl::receive(
         }
         client = it->second;
     }
-    return client->receive(transactionId, bufferId, timestampUs, buffer);
+    return client->receive(transactionId, bufferId, timestampUs, handle, buffer);
 }
 
 ResultStatus ClientManager::Impl::postSend(
-        ConnectionId connectionId, ConnectionId receiverId,
-        const std::shared_ptr<_C2BlockPoolData> &buffer,
+        ConnectionId receiverId, const std::shared_ptr<BufferPoolData> &buffer,
         TransactionId *transactionId, int64_t *timestampUs) {
+    ConnectionId connectionId = buffer->mConnectionId;
     std::shared_ptr<BufferPoolClient> client;
     {
         std::lock_guard<std::mutex> lock(mActive.mMutex);
@@ -288,9 +289,9 @@ ResultStatus ClientManager::close(ConnectionId connectionId) {
 
 ResultStatus ClientManager::allocate(
         ConnectionId connectionId, const std::vector<uint8_t> &params,
-        std::shared_ptr<_C2BlockPoolData> *buffer) {
+        native_handle_t **handle, std::shared_ptr<BufferPoolData> *buffer) {
     if (mImpl) {
-        return mImpl->allocate(connectionId, params, buffer);
+        return mImpl->allocate(connectionId, params, handle, buffer);
     }
     return ResultStatus::CRITICAL_ERROR;
 }
@@ -298,21 +299,19 @@ ResultStatus ClientManager::allocate(
 ResultStatus ClientManager::receive(
         ConnectionId connectionId, TransactionId transactionId,
         BufferId bufferId, int64_t timestampUs,
-        std::shared_ptr<_C2BlockPoolData> *buffer) {
+        native_handle_t **handle, std::shared_ptr<BufferPoolData> *buffer) {
     if (mImpl) {
         return mImpl->receive(connectionId, transactionId, bufferId,
-                              timestampUs, buffer);
+                              timestampUs, handle, buffer);
     }
     return ResultStatus::CRITICAL_ERROR;
 }
 
 ResultStatus ClientManager::postSend(
-        ConnectionId connectionId, ConnectionId receiverId,
-        const std::shared_ptr<_C2BlockPoolData> &buffer,
+        ConnectionId receiverId, const std::shared_ptr<BufferPoolData> &buffer,
         TransactionId *transactionId, int64_t* timestampUs) {
-    if (mImpl) {
-        return mImpl->postSend(connectionId, receiverId, buffer,
-                               transactionId, timestampUs);
+    if (mImpl && buffer) {
+        return mImpl->postSend(receiverId, buffer, transactionId, timestampUs);
     }
     return ResultStatus::CRITICAL_ERROR;
 }
@@ -324,10 +323,6 @@ ResultStatus ClientManager::getAccessor(
     }
     return ResultStatus::CRITICAL_ERROR;
 }
-
-//IClientManager* HIDL_FETCH_IClientManager(const char* /* name */) {
-//    return new ClientManager();
-//}
 
 }  // namespace implementation
 }  // namespace V1_0
