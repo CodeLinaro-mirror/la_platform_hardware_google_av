@@ -24,8 +24,8 @@
 #include <hardware/google/media/c2/1.0/IComponentListener.h>
 #include <hardware/google/media/c2/1.0/IComponentStore.h>
 #include <hardware/google/media/c2/1.0/IComponent.h>
-#include <hidl/MQDescriptor.h>
 #include <hidl/Status.h>
+#include <hwbinder/IBinder.h>
 
 #include <C2Component.h>
 #include <C2Buffer.h>
@@ -48,6 +48,7 @@ using ::android::hardware::hidl_string;
 using ::android::hardware::hidl_vec;
 using ::android::hardware::Return;
 using ::android::hardware::Void;
+using ::android::hardware::IBinder;
 using ::android::sp;
 using ::android::wp;
 
@@ -113,16 +114,43 @@ protected:
     // destroyBlockPool(), reset() or release(), or by destroying the component.
     std::map<uint64_t, std::shared_ptr<C2BlockPool>> mBlockPools;
 
-    struct CompareRawPointer {
-        constexpr bool operator()(
-                const wp<IComponent>& x, const wp<IComponent>& y) const {
-            return std::less<IComponent*>()(x.unsafe_get(), y.unsafe_get());
+    // This struct is a comparable wrapper for IComponent.
+    //
+    // An IComponent object is either local or remote. If it is local, we can
+    // use the underlying pointer as a key. If it is remote, we have to use the
+    // underlying pointer of the associated binder object as a key.
+    //
+    // See interfacesEqual() for more detail.
+    struct InterfaceKey {
+        // An InterfaceKey is constructed from IComponent.
+        InterfaceKey(const sp<IComponent>& component);
+        // operator< is defined here to control the default definition of
+        // std::less<InterfaceKey>, which will be used in type Roster defined
+        // below.
+        bool operator<(const InterfaceKey& other) const {
+            return isRemote ?
+                    (other.isRemote ?
+                        // remote & remote
+                        std::less<IBinder*>()(
+                            remote.unsafe_get(),
+                            other.remote.unsafe_get()) :
+                        // remote & local
+                        false) :
+                    (other.isRemote ?
+                        // local & remote
+                        true :
+                        // local & local
+                        std::less<IComponent*>()(
+                            local.unsafe_get(),
+                            other.local.unsafe_get()));
         }
+    private:
+        bool isRemote;
+        wp<IBinder> remote;
+        wp<IComponent> local;
     };
 
-    // Component lifetime management
-    typedef std::map<wp<IComponent>, std::weak_ptr<C2Component>,
-            CompareRawPointer> Roster;
+    typedef std::map<InterfaceKey, std::weak_ptr<C2Component>> Roster;
     typedef Roster::const_iterator LocalId;
     LocalId mLocalId;
     void setLocalId(const LocalId& localId);

@@ -43,6 +43,7 @@ namespace utils {
 using ::android::hardware::media::bufferpool::V1_0::IClientManager;
 
 using ::android::hardware::hidl_array;
+using ::android::hardware::hidl_handle;
 using ::android::hardware::hidl_memory;
 using ::android::hardware::hidl_string;
 using ::android::hardware::hidl_vec;
@@ -81,6 +82,11 @@ struct ComponentStore : public Configurable<IComponentStore> {
             const Buffer& src,
             const Buffer& dst) override;
 
+    // Debug dump
+    Return<void> debug(
+            const hidl_handle& handle,
+            const hidl_vec<hidl_string>& args) override;
+
 protected:
 
     c2_status_t mInit;
@@ -100,7 +106,7 @@ protected:
 
     // C2Component lookup
     std::shared_ptr<C2Component> findC2Component(
-            const wp<IComponent>& component) const;
+            const sp<IComponent>& component) const;
 
     friend struct InputSurface;
 };
