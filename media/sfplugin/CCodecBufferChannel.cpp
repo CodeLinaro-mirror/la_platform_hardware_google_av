@@ -24,6 +24,7 @@
 #include <C2AllocatorGralloc.h>
 #include <C2PlatformSupport.h>
 #include <C2BlockInternal.h>
+#include <C2Config.h>
 
 #include <android/hardware/cas/native/1.0/IDescrambler.h>
 #include <binder/MemoryDealer.h>
@@ -63,6 +64,13 @@ public:
     void setFormat(const sp<AMessage> &format) {
         CHECK(format != nullptr);
         mFormat = format;
+    }
+
+    /**
+     * Return a copy of current format.
+     */
+    sp<AMessage> dupFormat() {
+        return mFormat != nullptr ? mFormat->dup() : nullptr;
     }
 
     /**
@@ -176,11 +184,32 @@ private:
     DISALLOW_EVIL_CONSTRUCTORS(OutputBuffers);
 };
 
+class CCodecBufferChannel::OutputBufferQueue {
+public:
+    OutputBufferQueue() : mIgbp(nullptr), mIgbpId(0) {}
+    bool isNewIgbp(sp<IGraphicBufferProducer> igbp) {
+        if (!igbp || igbp == mIgbp) return false;
+        mIgbp = igbp;
+        mIgbp->getUniqueId(&mIgbpId);
+        mIgbp->setGenerationNumber(0);
+        mIgbp->setMaxDequeuedBufferCount(16); // TODO: tune
+        return true;
+    }
+
+    bool isNewIgbpId(uint64_t igbpId) {
+        return igbpId != mIgbpId;
+    }
+
+private:
+    sp<IGraphicBufferProducer> mIgbp;
+    uint64_t mIgbpId;
+};
+
 namespace {
 
 // TODO: get this info from component
 const static size_t kMinBufferArraySize = 16;
-const static size_t kLinearBufferSize = 524288;
+const static size_t kLinearBufferSize = 1048576;
 const static size_t kMaxGraphicBufferRefCount = 4;
 
 /**
@@ -368,7 +397,7 @@ public:
             }
         }
         if (c2Buffer == nullptr) {
-            ALOGD("No matching buffer found");
+            ALOGV("No matching buffer found");
             return nullptr;
         }
         std::shared_ptr<C2Buffer> result = c2Buffer->asC2Buffer();
@@ -469,7 +498,7 @@ public:
             }
         }
         if (c2Buffer == nullptr) {
-            ALOGD("No matching buffer found");
+            ALOGV("No matching buffer found");
             return nullptr;
         }
         std::shared_ptr<C2Buffer> result = c2Buffer->asC2Buffer();
@@ -557,9 +586,11 @@ public:
     using CCodecBufferChannel::InputBuffers::InputBuffers;
 
     bool requestNewBuffer(size_t *index, sp<MediaCodecBuffer> *buffer) override {
+        int32_t capacity = kLinearBufferSize;
+        (void)mFormat->findInt32(C2_NAME_STREAM_MAX_BUFFER_SIZE_SETTING, &capacity);
         // TODO: proper max input size
         // TODO: read usage from intf
-        sp<Codec2Buffer> newBuffer = alloc(kLinearBufferSize);
+        sp<Codec2Buffer> newBuffer = alloc((size_t)capacity);
         if (newBuffer == nullptr) {
             return false;
         }
@@ -579,6 +610,7 @@ public:
 
     std::unique_ptr<CCodecBufferChannel::InputBuffers> toArrayMode() final {
         std::unique_ptr<InputBuffersArray> array(new InputBuffersArray);
+        array->setPool(mPool);
         array->setFormat(mFormat);
         array->initialize(
                 mImpl,
@@ -665,6 +697,58 @@ private:
     std::vector<Entry> mMemoryVector;
 };
 
+class GraphicMetadataInputBuffers : public CCodecBufferChannel::InputBuffers {
+public:
+    GraphicMetadataInputBuffers() : mStore(GetCodec2PlatformAllocatorStore()) {}
+    ~GraphicMetadataInputBuffers() override = default;
+
+    bool requestNewBuffer(size_t *index, sp<MediaCodecBuffer> *buffer) override {
+        std::shared_ptr<C2Allocator> alloc;
+        c2_status_t err = mStore->fetchAllocator(mPool->getAllocatorId(), &alloc);
+        if (err != C2_OK) {
+            return false;
+        }
+        sp<GraphicMetadataBuffer> newBuffer = new GraphicMetadataBuffer(mFormat, alloc);
+        if (newBuffer == nullptr) {
+            return false;
+        }
+        *index = mImpl.assignSlot(newBuffer);
+        *buffer = newBuffer;
+        return true;
+    }
+
+    std::shared_ptr<C2Buffer> releaseBuffer(const sp<MediaCodecBuffer> &buffer) override {
+        return mImpl.releaseSlot(buffer);
+    }
+
+    void flush() override {
+        // This is no-op by default unless we're in array mode where we need to keep
+        // track of the flushed work.
+    }
+
+    std::unique_ptr<CCodecBufferChannel::InputBuffers> toArrayMode() final {
+        std::shared_ptr<C2Allocator> alloc;
+        c2_status_t err = mStore->fetchAllocator(mPool->getAllocatorId(), &alloc);
+        if (err != C2_OK) {
+            return nullptr;
+        }
+        std::unique_ptr<InputBuffersArray> array(new InputBuffersArray);
+        array->setPool(mPool);
+        array->setFormat(mFormat);
+        array->initialize(
+                mImpl,
+                kMinBufferArraySize,
+                [format = mFormat, alloc]() -> sp<Codec2Buffer> {
+                    return new GraphicMetadataBuffer(format, alloc);
+                });
+        return std::move(array);
+    }
+
+private:
+    FlexBuffersImpl mImpl;
+    std::shared_ptr<C2AllocatorStore> mStore;
+};
+
 class GraphicInputBuffers : public CCodecBufferChannel::InputBuffers {
 public:
     GraphicInputBuffers() : mLocalBufferPool(LocalBufferPool::Create(1920 * 1080 * 16)) {}
@@ -695,6 +779,7 @@ public:
 
     std::unique_ptr<CCodecBufferChannel::InputBuffers> toArrayMode() final {
         std::unique_ptr<InputBuffersArray> array(new InputBuffersArray);
+        array->setPool(mPool);
         array->setFormat(mFormat);
         array->initialize(
                 mImpl,
@@ -795,11 +880,6 @@ public:
         if (err != OK) {
             return false;
         }
-        // TODO: proper format update
-        sp<ABuffer> csdBuffer = ABuffer::CreateAsCopy(csd->m.value, csd->flexCount());
-        mFormat = mFormat->dup();
-        mFormat->setBuffer("csd-0", csdBuffer);
-
         memcpy(c2Buffer->base(), csd->m.value, csd->flexCount());
         c2Buffer->setRange(0, csd->flexCount());
         c2Buffer->setFormat(mFormat);
@@ -843,12 +923,8 @@ public:
             const C2StreamCsdInfo::output *csd,
             size_t *index,
             sp<MediaCodecBuffer> *clientBuffer) final {
-        // TODO: proper format update
-        sp<ABuffer> csdBuffer = ABuffer::CreateAsCopy(csd->m.value, csd->flexCount());
-        mFormat = mFormat->dup();
-        mFormat->setBuffer("csd-0", csdBuffer);
-
-        sp<Codec2Buffer> newBuffer = new LocalLinearBuffer(mFormat, csdBuffer);
+        sp<Codec2Buffer> newBuffer = new LocalLinearBuffer(
+                mFormat, ABuffer::CreateAsCopy(csd->m.value, csd->flexCount()));
         *index = mImpl.assignSlot(newBuffer);
         *clientBuffer = newBuffer;
         return true;
@@ -943,12 +1019,20 @@ public:
     ~RawGraphicOutputBuffers() override = default;
 
     sp<Codec2Buffer> wrap(const std::shared_ptr<C2Buffer> &buffer) override {
-        return ConstGraphicBlockBuffer::Allocate(
-                mFormat,
-                buffer,
-                [lbp = mLocalBufferPool](size_t capacity) {
-                    return lbp->newBuffer(capacity);
-                });
+        if (buffer == nullptr) {
+            return ConstGraphicBlockBuffer::AllocateEmpty(
+                    mFormat,
+                    [lbp = mLocalBufferPool](size_t capacity) {
+                        return lbp->newBuffer(capacity);
+                    });
+        } else {
+            return ConstGraphicBlockBuffer::Allocate(
+                    mFormat,
+                    buffer,
+                    [lbp = mLocalBufferPool](size_t capacity) {
+                        return lbp->newBuffer(capacity);
+                    });
+        }
     }
 
     sp<Codec2Buffer> allocateArrayBuffer() override {
@@ -1015,7 +1099,9 @@ CCodecBufferChannel::CCodecBufferChannel(
     : mHeapSeqNum(-1),
       mOnError(onError),
       mFrameIndex(0u),
-      mFirstValidFrameIndex(0u) {
+      mFirstValidFrameIndex(0u),
+      mOutputBufferQueue(new OutputBufferQueue()),
+      mMetaMode(MODE_NONE) {
 }
 
 CCodecBufferChannel::~CCodecBufferChannel() {
@@ -1034,6 +1120,13 @@ status_t CCodecBufferChannel::setInputSurface(
     ALOGV("setInputSurface");
     mInputSurface = surface;
     return OK;
+}
+
+status_t CCodecBufferChannel::signalEndOfInputStream() {
+    if (mInputSurface == nullptr) {
+        return INVALID_OPERATION;
+    }
+    return mInputSurface->signalEndOfInputStream();
 }
 
 status_t CCodecBufferChannel::queueInputBufferInternal(const sp<MediaCodecBuffer> &buffer) {
@@ -1207,6 +1300,15 @@ status_t CCodecBufferChannel::renderOutputBuffer(
         ALOGE("no surface");
         return OK;
     }
+    sp<IGraphicBufferProducer> igbp = output->surface->getIGraphicBufferProducer();
+    if (mOutputBufferQueue->isNewIgbp(igbp)) {
+        sp<HGraphicBufferProducer> higbp = igbp->getHalInterface();
+        if (!higbp) {
+            higbp = new TWGraphicBufferProducer<HGraphicBufferProducer>(igbp);
+        }
+        // TODO: use id of block pool which is crated from component
+        mComponent->setOutputSurface(C2BlockPool::PLATFORM_START, higbp);
+    }
 
     std::vector<C2ConstGraphicBlock> blocks = c2Buffer->data().graphicBlocks();
     if (blocks.size() != 1u) {
@@ -1221,50 +1323,54 @@ status_t CCodecBufferChannel::renderOutputBuffer(
     uint32_t format;
     uint64_t usage;
     uint32_t stride;
+    uint64_t igbp_id;
+    int32_t igbp_slot;
     _UnwrapNativeCodec2GrallocMetadata(
-            block.handle(), &width, &height, &format, &usage, &stride);
+            block.handle(), &width, &height, &format, &usage, &stride,
+            &igbp_id, (uint32_t *)&igbp_slot);
     ALOGV("attaching buffer (%u*%u): (%u*%u, fmt %#x, usage %#llx, stride %u)",
             block.width(),
             block.height(),
             width, height, format, (long long)usage, stride);
 
-    sp<GraphicBuffer> graphicBuffer(new GraphicBuffer(
-            grallocHandle,
-            GraphicBuffer::CLONE_HANDLE,
-            width, height, format, 1, usage, stride));
+    status_t result = OK;
+    if (mOutputBufferQueue->isNewIgbpId(igbp_id)) {
+        sp<GraphicBuffer> graphicBuffer(new GraphicBuffer(
+                grallocHandle,
+                GraphicBuffer::CLONE_HANDLE,
+                width, height, format, 1, usage, stride));
+        // TODO: detach?
+        graphicBuffer->setGenerationNumber(0);
+        result = igbp->attachBuffer(&igbp_slot, graphicBuffer);
+        if (result != OK) {
+            native_handle_delete(grallocHandle);
+            ALOGI("attachBuffer failed: %d", result);
+            return result;
+        }
+        ALOGV("attach buffer from %" PRIu64 " : %d", igbp_id, igbp_slot);
+    } else {
+        ALOGV("dequeued buffer arrived %" PRIu64 " %d", igbp_id, igbp_slot);
+    }
     native_handle_delete(grallocHandle);
 
-    status_t result = output->surface->attachBuffer(graphicBuffer.get());
-    if (result != OK) {
-        ALOGE("attachBuffer failed: %d", result);
-        return result;
-    }
-
-    ALOGV("crop: %u,%u .. %u,%u",
-          block.crop().left, block.crop().top,
-          block.crop().width, block.crop().height);
-    android_native_rect_t cropRect = {
-        (int32_t)block.crop().left, (int32_t)block.crop().top,
-        (int32_t)block.crop().right(), (int32_t)block.crop().bottom()
-    };
-    result = native_window_set_crop(output->surface.get(), &cropRect);
-
-    result = native_window_set_buffers_timestamp(output->surface.get(), timestampNs);
-    ALOGW_IF(result != OK, "failed to set buffer timestamp: %d", result);
-
-    // TODO: fix after C2Fence implementation
-#if 0
-    const C2Fence &fence = blocks.front().fence();
-    result = ((ANativeWindow *)output->surface.get())->queueBuffer(
-            output->surface.get(), graphicBuffer.get(), fence.valid() ? fence.fd() : -1);
-#else
-    result = ((ANativeWindow *)output->surface.get())->queueBuffer(
-            output->surface.get(), graphicBuffer.get(), -1);
-#endif
+    // TODO
+    // revisit this after C2Fence implementation.
+    // apply dataspace and scaling mode (getting scaling mode from native_window is not possible.)
+    android::IGraphicBufferProducer::QueueBufferInput qbi(
+            timestampNs,
+            false,
+            HAL_DATASPACE_UNKNOWN,
+            Rect(blocks.front().width(), blocks.front().height()),
+            NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW,
+            0,
+            Fence::NO_FENCE, 0);
+    android::IGraphicBufferProducer::QueueBufferOutput qbo;
+    result = igbp->queueBuffer(igbp_slot, qbi, &qbo);
     if (result != OK) {
         ALOGE("queueBuffer failed: %d", result);
         return result;
     }
+    ALOGV("queue buffer successful");
 
     // XXX: Hack to keep C2Buffers unreleased until the consumer is done
     //      reading the content. Eventually IGBP-based C2BlockPool should handle
@@ -1280,17 +1386,22 @@ status_t CCodecBufferChannel::renderOutputBuffer(
 
 status_t CCodecBufferChannel::discardBuffer(const sp<MediaCodecBuffer> &buffer) {
     ALOGV("discardBuffer: %p", buffer.get());
+    bool released = false;
     {
         Mutexed<std::unique_ptr<InputBuffers>>::Locked buffers(mInputBuffers);
-        (void)(*buffers)->releaseBuffer(buffer);
+        released = ((*buffers)->releaseBuffer(buffer) != nullptr);
     }
     {
         Mutexed<std::unique_ptr<OutputBuffers>>::Locked buffers(mOutputBuffers);
-        if((*buffers)->releaseBuffer(buffer)) {
+        if ((*buffers)->releaseBuffer(buffer)) {
+            released = true;
             buffers.unlock();
             feedInputBufferIfAvailable();
             buffers.lock();
         }
+    }
+    if (!released) {
+        ALOGD("MediaCodec discarded an unknown buffer");
     }
     return OK;
 }
@@ -1338,6 +1449,8 @@ status_t CCodecBufferChannel::start(
         if (graphic) {
             if (mInputSurface) {
                 buffers->reset(new DummyInputBuffers);
+            } else if (mMetaMode == MODE_ANW) {
+                buffers->reset(new GraphicMetadataInputBuffers);
             } else {
                 buffers->reset(new GraphicInputBuffers);
             }
@@ -1366,17 +1479,12 @@ status_t CCodecBufferChannel::start(
         ALOGV("graphic = %s", graphic ? "true" : "false");
         std::shared_ptr<C2BlockPool> pool;
         if (graphic) {
-            err = mComponent->getLocalBlockPool(
-                    C2BlockPool::BASIC_GRAPHIC,
-                    &pool);
+            // TODO: create proper blockpool.
+            err = CreateCodec2BlockPool(
+                    C2PlatformAllocatorStore::BUFFERQUEUE, nullptr, &pool);
         } else {
-            /* TODO: Use BufferPool-based BlockPool
-            err = mComponent->createLocalBlockPool(
-                    C2PlatformAllocatorStore::ION,
-                    &pool);*/
-            err = mComponent->getLocalBlockPool(
-                    C2BlockPool::BASIC_LINEAR,
-                    &pool);
+            err = CreateCodec2BlockPool(
+                    C2PlatformAllocatorStore::ION, nullptr, &pool);
         }
         if (err == C2_OK) {
             (*buffers)->setPool(pool);
@@ -1404,7 +1512,7 @@ status_t CCodecBufferChannel::start(
         } else {
             buffers->reset(new LinearOutputBuffers);
         }
-        (*buffers)->setFormat(outputFormat);
+        (*buffers)->setFormat(outputFormat->dup());
     }
 
     mSync.start();
@@ -1455,7 +1563,7 @@ void CCodecBufferChannel::flush(const std::list<std::unique_ptr<C2Work>> &flushe
     }
 }
 
-void CCodecBufferChannel::onWorkDone(const std::unique_ptr<C2Work> &work) {
+void CCodecBufferChannel::onWorkDone(std::unique_ptr<C2Work> work) {
     if (work->input.buffers.size() == 1) {
         // TODO: Use BufferPool
         Mutexed<InputRefs>::Locked inputRefs(mInputRefs);
@@ -1505,10 +1613,47 @@ void CCodecBufferChannel::onWorkDone(const std::unique_ptr<C2Work> &work) {
     }
 
     const C2StreamCsdInfo::output *csdInfo = nullptr;
-    for (const std::unique_ptr<C2Param> &info : worklet->output.configUpdate) {
-        if (info->coreIndex() == C2StreamCsdInfo::output::CORE_INDEX) {
-            ALOGV("onWorkDone: csd found");
-            csdInfo = static_cast<const C2StreamCsdInfo::output *>(info.get());
+    if (!worklet->output.configUpdate.empty()) {
+        Mutexed<std::unique_ptr<OutputBuffers>>::Locked buffers(mOutputBuffers);
+        sp<AMessage> newFormat = (*buffers)->dupFormat();
+        bool changed = false;
+        for (const std::unique_ptr<C2Param> &info : worklet->output.configUpdate) {
+            switch (info->coreIndex().coreIndex()) {
+                case C2StreamCsdInfo::output::CORE_INDEX:
+                    ALOGV("onWorkDone: csd found");
+                    csdInfo = static_cast<const C2StreamCsdInfo::output *>(info.get());
+                    // TODO: proper format update
+                    newFormat->setBuffer(
+                            "csd-0",
+                            ABuffer::CreateAsCopy(csdInfo->m.value, csdInfo->flexCount()));
+                    changed = true;
+                    break;
+                case C2VideoSizeStreamInfo::output::CORE_INDEX:
+                    newFormat->setInt32(
+                            "width",
+                            ((C2VideoSizeStreamInfo::output *)info.get())->width);
+                    newFormat->setInt32(
+                            "height",
+                            ((C2VideoSizeStreamInfo::output *)info.get())->height);
+                    changed = true;
+                    break;
+                case C2StreamSampleRateInfo::output::CORE_INDEX:
+                    newFormat->setInt32(
+                            "sample-rate",
+                            ((C2StreamSampleRateInfo::output *)info.get())->value);
+                    changed = true;
+                    break;
+                case C2StreamChannelCountInfo::output::CORE_INDEX:
+                    newFormat->setInt32(
+                            "channel-count",
+                            ((C2StreamChannelCountInfo::output *)info.get())->value);
+                    changed = true;
+                    break;
+            }
+        }
+        if (changed) {
+            ALOGV("output format changed; newFormat = %s", newFormat->debugString().c_str());
+            (*buffers)->setFormat(newFormat);
         }
     }
 
@@ -1580,6 +1725,7 @@ void CCodecBufferChannel::onWorkDone(const std::unique_ptr<C2Work> &work) {
 status_t CCodecBufferChannel::setSurface(const sp<Surface> &newSurface) {
     if (newSurface != nullptr) {
         newSurface->setScalingMode(NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW);
+        newSurface->setMaxDequeuedBufferCount(kMinBufferArraySize);
     }
 
     Mutexed<OutputSurface>::Locked output(mOutputSurface);
@@ -1602,6 +1748,10 @@ status_t CCodecBufferChannel::setSurface(const sp<Surface> &newSurface) {
     output->maxBufferCount = kMaxGraphicBufferRefCount;
 
     return OK;
+}
+
+void CCodecBufferChannel::setMetaMode(MetaMode mode) {
+    mMetaMode = mode;
 }
 
 }  // namespace android

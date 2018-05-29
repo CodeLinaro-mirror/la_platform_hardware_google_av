@@ -446,7 +446,7 @@ public:
     // otherwise, do not copy anything, and return false.
     inline bool updateFrom(const C2Param &other) {
         if (other._mSize <= _mSize && other._mIndex == _mIndex && _mSize > 0) {
-            memcpy(this, &other, _mSize);
+            memcpy(this, &other, other._mSize);
             return true;
         }
         return false;
@@ -620,6 +620,7 @@ struct _C2FieldId {
 
 private:
     friend struct _C2ParamInspector;
+    friend struct C2FieldDescriptor;
 
     uint32_t _mOffset; // offset of field
     uint32_t _mSize;   // size of field
@@ -661,6 +662,9 @@ struct C2ParamField {
      *
      * \todo fix what this is for T[] (for now size becomes T[1])
      *
+     * \note this does not work for 64-bit members as it triggers a
+     * 'taking address of packed member' warning.
+     *
      * \param param pointer to parameter
      * \param offset member pointer
      */
@@ -668,6 +672,11 @@ struct C2ParamField {
     inline C2ParamField(S* param, T* offset)
         : _mIndex(param->index()),
           _mFieldId((T*)((uintptr_t)offset - (uintptr_t)param)) {}
+
+    template<typename S, typename T>
+    inline static C2ParamField Make(S& param, T& offset) {
+        return C2ParamField(param.index(), (uintptr_t)&offset - (uintptr_t)&param, sizeof(T));
+    }
 
     /**
      * Create a field identifier using a configuration parameter (variable),
@@ -757,7 +766,14 @@ public:
         Primitive(uint32_t value)    : u32(value) { }
         Primitive(int32_t value)     : i32(value) { }
         Primitive(c2_cntr32_t value) : c32(value) { }
+        Primitive(uint8_t value)     : u32(value) { }
+        Primitive(char value)        : i32(value) { }
         Primitive(float value)       : fp(value)  { }
+
+        // allow construction from enum type
+        template<typename E, typename = typename std::enable_if<std::is_enum<E>::value>::type>
+        Primitive(E value)
+            : Primitive(static_cast<typename std::underlying_type<E>::type>(value)) { }
 
         Primitive() : u64(0) { }
 
@@ -767,7 +783,18 @@ public:
 
         /** gets value out of the union */
         template<typename T> const T &ref() const;
+
+        // verify that we can assume standard aliasing
+        static_assert(sizeof(u64) == sizeof(i64), "");
+        static_assert(sizeof(u64) == sizeof(c64), "");
+        static_assert(sizeof(u32) == sizeof(i32), "");
+        static_assert(sizeof(u32) == sizeof(c32), "");
     };
+    // verify that we can assume standard aliasing
+    static_assert(offsetof(Primitive, u64) == offsetof(Primitive, i64), "");
+    static_assert(offsetof(Primitive, u64) == offsetof(Primitive, c64), "");
+    static_assert(offsetof(Primitive, u32) == offsetof(Primitive, i32), "");
+    static_assert(offsetof(Primitive, u32) == offsetof(Primitive, c32), "");
 
     enum type_t : uint32_t {
         NO_INIT,
@@ -780,7 +807,17 @@ public:
         FLOAT,
     };
 
-    template<typename T> static constexpr type_t typeFor();
+    template<typename T, bool = std::is_enum<T>::value>
+    inline static constexpr type_t TypeFor() {
+        using U = typename std::underlying_type<T>::type;
+        return TypeFor<U>();
+    }
+
+    // deprectated
+    template<typename T, bool B = std::is_enum<T>::value>
+    inline static constexpr type_t typeFor() {
+        return TypeFor<T, B>();
+    }
 
     // constructors - implicit
     template<typename T>
@@ -799,6 +836,29 @@ public:
         return false;
     }
 
+    /// returns the address of the value
+    void *get() const {
+        return _mType == NO_INIT ? nullptr : (void*)&_mValue;
+    }
+
+    /// returns the size of the contained value
+    size_t inline sizeOf() const {
+        return SizeFor(_mType);
+    }
+
+    static size_t SizeFor(type_t type) {
+        switch (type) {
+            case INT32:
+            case UINT32:
+            case CNTR32: return sizeof(_mValue.i32);
+            case INT64:
+            case UINT64:
+            case CNTR64: return sizeof(_mValue.i64);
+            case FLOAT: return sizeof(_mValue.fp);
+            default: return 0;
+        }
+    }
+
 private:
     type_t _mType;
     Primitive _mValue;
@@ -812,13 +872,19 @@ template<> inline const c2_cntr32_t &C2Value::Primitive::ref<c2_cntr32_t>() cons
 template<> inline const c2_cntr64_t &C2Value::Primitive::ref<c2_cntr64_t>() const { return c64; }
 template<> inline const float &C2Value::Primitive::ref<float>() const { return fp; }
 
-template<> constexpr C2Value::type_t C2Value::typeFor<int32_t>() { return INT32; }
-template<> constexpr C2Value::type_t C2Value::typeFor<int64_t>() { return INT64; }
-template<> constexpr C2Value::type_t C2Value::typeFor<uint32_t>() { return UINT32; }
-template<> constexpr C2Value::type_t C2Value::typeFor<uint64_t>() { return UINT64; }
-template<> constexpr C2Value::type_t C2Value::typeFor<c2_cntr32_t>() { return CNTR32; }
-template<> constexpr C2Value::type_t C2Value::typeFor<c2_cntr64_t>() { return CNTR64; }
-template<> constexpr C2Value::type_t C2Value::typeFor<float>() { return FLOAT; }
+// provide types for enums and uint8_t, char even though we don't provide reading as them
+template<> constexpr C2Value::type_t C2Value::TypeFor<char, false>() { return INT32; }
+template<> constexpr C2Value::type_t C2Value::TypeFor<int32_t, false>() { return INT32; }
+template<> constexpr C2Value::type_t C2Value::TypeFor<int64_t, false>() { return INT64; }
+template<> constexpr C2Value::type_t C2Value::TypeFor<uint8_t, false>() { return UINT32; }
+template<> constexpr C2Value::type_t C2Value::TypeFor<uint32_t, false>() { return UINT32; }
+template<> constexpr C2Value::type_t C2Value::TypeFor<uint64_t, false>() { return UINT64; }
+template<> constexpr C2Value::type_t C2Value::TypeFor<c2_cntr32_t, false>() { return CNTR32; }
+template<> constexpr C2Value::type_t C2Value::TypeFor<c2_cntr64_t, false>() { return CNTR64; }
+template<> constexpr C2Value::type_t C2Value::TypeFor<float, false>() { return FLOAT; }
+
+// forward declare easy enum template
+template<typename E> struct C2EasyEnum;
 
 /**
  * field descriptor. A field is uniquely defined by an index into a parameter.
@@ -866,15 +932,28 @@ struct C2FieldDescriptor {
     template<typename B>
     static NamedValuesType namedValuesFor(const B &);
 
+    /** specialization for easy enums */
+    template<typename E>
+    inline static NamedValuesType namedValuesFor(const C2EasyEnum<E> &) {
+        return namedValuesFor(*(E*)nullptr);
+    }
+
+private:
+    template<typename B, bool enabled=std::is_arithmetic<B>::value || std::is_enum<B>::value>
+    struct C2_HIDE _NamedValuesGetter;
+
+public:
     inline C2FieldDescriptor(uint32_t type, uint32_t extent, C2String name, size_t offset, size_t size)
         : _mType((type_t)type), _mExtent(extent), _mName(name), _mFieldId(offset, size) { }
+
+    inline C2FieldDescriptor(const C2FieldDescriptor &) = default;
 
     template<typename T, class B=typename std::remove_extent<T>::type>
     inline C2FieldDescriptor(const T* offset, const char *name)
         : _mType(this->GetType((B*)nullptr)),
           _mExtent(std::is_array<T>::value ? std::extent<T>::value : 1),
           _mName(name),
-          _mNamedValues(namedValuesFor(*(B*)0)),
+          _mNamedValues(_NamedValuesGetter<B>::getNamedValues()),
           _mFieldId(offset) {}
 
 /*
@@ -911,6 +990,14 @@ struct C2FieldDescriptor {
 #endif
 
 private:
+    /**
+     * Construct an offseted field descriptor.
+     */
+    inline C2FieldDescriptor(const C2FieldDescriptor &desc, size_t offset)
+        : _mType(desc._mType), _mExtent(desc._mExtent),
+          _mName(desc._mName), _mNamedValues(desc._mNamedValues),
+          _mFieldId(desc._mFieldId._mOffset + offset, desc._mFieldId._mSize) { }
+
     type_t _mType;
     uint32_t _mExtent; // the last member can be arbitrary length if it is T[] array,
                        // extending to the end of the parameter (this is marked with
@@ -951,6 +1038,21 @@ private:
     }
 
     friend struct _C2ParamInspector;
+};
+
+// no named values for compound types
+template<typename B>
+struct C2FieldDescriptor::_NamedValuesGetter<B, false> {
+    inline static C2FieldDescriptor::NamedValuesType getNamedValues() {
+        return NamedValuesType();
+    }
+};
+
+template<typename B>
+struct C2FieldDescriptor::_NamedValuesGetter<B, true> {
+    inline static C2FieldDescriptor::NamedValuesType getNamedValues() {
+        return C2FieldDescriptor::namedValuesFor(*(B*)nullptr);
+    }
 };
 
 #define DEFINE_NO_NAMED_VALUES_FOR(type) \
@@ -1136,24 +1238,34 @@ public: \
     enum : uint32_t { CORE_INDEX = kParamIndex##name | C2Param::CoreIndex::IS_FLEX_FLAG }; \
     DEFINE_BASE_C2STRUCT(name)
 
-#ifdef __C2_GENERATE_GLOBAL_VARS__
 /// \ingroup internal
 /// Describe a structure of a templated structure.
-#define DESCRIBE_TEMPLATED_C2STRUCT(strukt, list) \
-    template<> \
-    const std::vector<C2FieldDescriptor> strukt::FieldList() { return list; }
+// Use list... as the argument gets resubsitituted and it contains commas. Alternative would be
+// to wrap list in an expression, e.g. ({ std::vector<C2FieldDescriptor> list; })) which converts
+// it from an initializer list to a vector.
+#define DESCRIBE_TEMPLATED_C2STRUCT(strukt, list...) \
+    _DESCRIBE_TEMPLATABLE_C2STRUCT(template<>, strukt, __C2_GENERATE_GLOBAL_VARS__, list)
 
 /// \deprecated
 /// Describe the fields of a structure using an initializer list.
-#define DESCRIBE_C2STRUCT(name, list) \
-    const std::vector<C2FieldDescriptor> C2##name##Struct::FieldList() { return list; }
+#define DESCRIBE_C2STRUCT(name, list...) \
+    _DESCRIBE_TEMPLATABLE_C2STRUCT(, C2##name##Struct, __C2_GENERATE_GLOBAL_VARS__, list)
 
-#else
-/// \if 0
-#define DESCRIBE_TEMPLATED_C2STRUCT(strukt, list)
-#define DESCRIBE_C2STRUCT(name, list)
-/// \endif
-#endif
+/// \ingroup internal
+/// Macro layer to get value of enabled that is passed in as a macro variable
+#define _DESCRIBE_TEMPLATABLE_C2STRUCT(template, strukt, enabled, list...) \
+    __DESCRIBE_TEMPLATABLE_C2STRUCT(template, strukt, enabled, list)
+
+/// \ingroup internal
+/// Macro layer to resolve to the specific macro based on macro variable
+#define __DESCRIBE_TEMPLATABLE_C2STRUCT(template, strukt, enabled, list...) \
+    ___DESCRIBE_TEMPLATABLE_C2STRUCT##enabled(template, strukt, list)
+
+#define ___DESCRIBE_TEMPLATABLE_C2STRUCT(template, strukt, list...) \
+    template \
+    const std::vector<C2FieldDescriptor> strukt::FieldList() { return list; }
+
+#define ___DESCRIBE_TEMPLATABLE_C2STRUCT__C2_GENERATE_GLOBAL_VARS__(template, strukt, list...)
 
 /**
  * Describe a field of a structure.
@@ -1236,61 +1348,67 @@ public: \
 #define DESCRIBE_C2FIELD(member, name) \
   C2FieldDescriptor(&((_type*)(nullptr))->member, name),
 
-#ifdef __C2_GENERATE_GLOBAL_VARS__
-#define C2FIELD(member, name) DESCRIBE_C2FIELD(member, name)
-
-/// Define a structure with matching CORE_INDEX and start describing its fields.
-/// This must be at the end of the structure definition.
-#define DEFINE_AND_DESCRIBE_C2STRUCT(name) \
-    DEFINE_C2STRUCT(name) } C2_PACK; \
-    const std::vector<C2FieldDescriptor> C2##name##Struct::FieldList() { return _FIELD_LIST; } \
-    const std::vector<C2FieldDescriptor> C2##name##Struct::_FIELD_LIST = {
-
-/// Define a flexible structure with matching CORE_INDEX and start describing its fields.
-/// This must be at the end of the structure definition.
-#define DEFINE_AND_DESCRIBE_FLEX_C2STRUCT(name, flexMember) \
-    DEFINE_FLEX_C2STRUCT(name, flexMember) } C2_PACK; \
-    const std::vector<C2FieldDescriptor> C2##name##Struct::FieldList() { return _FIELD_LIST; } \
-    const std::vector<C2FieldDescriptor> C2##name##Struct::_FIELD_LIST = {
-
-/// Define a base structure (with no CORE_INDEX) and start describing its fields.
-/// This must be at the end of the structure definition.
-#define DEFINE_AND_DESCRIBE_BASE_C2STRUCT(name) \
-    DEFINE_BASE_C2STRUCT(name) } C2_PACK; \
-    const std::vector<C2FieldDescriptor> C2##name##Struct::FieldList() { return _FIELD_LIST; } \
-    const std::vector<C2FieldDescriptor> C2##name##Struct::_FIELD_LIST = {
-
-/// Define a flexible base structure (with no CORE_INDEX) and start describing its fields.
-/// This must be at the end of the structure definition.
-#define DEFINE_AND_DESCRIBE_BASE_FLEX_C2STRUCT(name, flexMember) \
-    DEFINE_BASE_FLEX_C2STRUCT(name, flexMember) } C2_PACK; \
-    const std::vector<C2FieldDescriptor> C2##name##Struct::FieldList() { return _FIELD_LIST; } \
-    const std::vector<C2FieldDescriptor> C2##name##Struct::_FIELD_LIST = {
-
-#else
+#define C2FIELD(member, name) _C2FIELD(member, name, __C2_GENERATE_GLOBAL_VARS__)
 /// \if 0
-/* Alternate declaration of field definitions in case no field list is to be generated.
-   TRICKY: use namespace declaration to handle closing bracket that is normally after
-   these macros. */
-#define C2FIELD(member, name)
+#define _C2FIELD(member, name, enabled) __C2FIELD(member, name, enabled)
+#define __C2FIELD(member, name, enabled) DESCRIBE_C2FIELD##enabled(member, name)
+#define DESCRIBE_C2FIELD__C2_GENERATE_GLOBAL_VARS__(member, name)
+/// \endif
+
 /// Define a structure with matching CORE_INDEX and start describing its fields.
 /// This must be at the end of the structure definition.
 #define DEFINE_AND_DESCRIBE_C2STRUCT(name) \
-    DEFINE_C2STRUCT(name) }  C2_PACK; namespace {
-/// Define a flexible structure with matching CORE_INDEX and start describing its fields.
-/// This must be at the end of the structure definition.
-#define DEFINE_AND_DESCRIBE_FLEX_C2STRUCT(name, flexMember) \
-    DEFINE_FLEX_C2STRUCT(name, flexMember) } C2_PACK; namespace {
+    _DEFINE_AND_DESCRIBE_C2STRUCT(name, DEFINE_C2STRUCT, __C2_GENERATE_GLOBAL_VARS__)
+
 /// Define a base structure (with no CORE_INDEX) and start describing its fields.
 /// This must be at the end of the structure definition.
 #define DEFINE_AND_DESCRIBE_BASE_C2STRUCT(name) \
-    DEFINE_BASE_C2STRUCT(name) } C2_PACK; namespace {
+    _DEFINE_AND_DESCRIBE_C2STRUCT(name, DEFINE_BASE_C2STRUCT, __C2_GENERATE_GLOBAL_VARS__)
+
+/// Define a flexible structure with matching CORE_INDEX and start describing its fields.
+/// This must be at the end of the structure definition.
+#define DEFINE_AND_DESCRIBE_FLEX_C2STRUCT(name, flexMember) \
+    _DEFINE_AND_DESCRIBE_FLEX_C2STRUCT( \
+            name, flexMember, DEFINE_FLEX_C2STRUCT, __C2_GENERATE_GLOBAL_VARS__)
+
 /// Define a flexible base structure (with no CORE_INDEX) and start describing its fields.
 /// This must be at the end of the structure definition.
 #define DEFINE_AND_DESCRIBE_BASE_FLEX_C2STRUCT(name, flexMember) \
-    DEFINE_BASE_FLEX_C2STRUCT(name, flexMember) } C2_PACK; namespace {
+    _DEFINE_AND_DESCRIBE_FLEX_C2STRUCT( \
+            name, flexMember, DEFINE_BASE_FLEX_C2STRUCT, __C2_GENERATE_GLOBAL_VARS__)
+
+/// \if 0
+/*
+   Alternate declaration of field definitions in case no field list is to be generated.
+   The specific macro is chosed based on the value of __C2_GENERATE_GLOBAL_VARS__ (whether it is
+   defined (to be empty) or not. This requires two level of macro substitution.
+   TRICKY: use namespace declaration to handle closing bracket that is normally after
+   these macros.
+*/
+
+#define _DEFINE_AND_DESCRIBE_C2STRUCT(name, defineMacro, enabled) \
+    __DEFINE_AND_DESCRIBE_C2STRUCT(name, defineMacro, enabled)
+#define __DEFINE_AND_DESCRIBE_C2STRUCT(name, defineMacro, enabled) \
+    ___DEFINE_AND_DESCRIBE_C2STRUCT##enabled(name, defineMacro)
+#define ___DEFINE_AND_DESCRIBE_C2STRUCT__C2_GENERATE_GLOBAL_VARS__(name, defineMacro) \
+    defineMacro(name) } C2_PACK; namespace {
+#define ___DEFINE_AND_DESCRIBE_C2STRUCT(name, defineMacro) \
+    defineMacro(name) } C2_PACK; \
+    const std::vector<C2FieldDescriptor> C2##name##Struct::FieldList() { return _FIELD_LIST; } \
+    const std::vector<C2FieldDescriptor> C2##name##Struct::_FIELD_LIST = {
+
+#define _DEFINE_AND_DESCRIBE_FLEX_C2STRUCT(name, flexMember, defineMacro, enabled) \
+    __DEFINE_AND_DESCRIBE_FLEX_C2STRUCT(name, flexMember, defineMacro, enabled)
+#define __DEFINE_AND_DESCRIBE_FLEX_C2STRUCT(name, flexMember, defineMacro, enabled) \
+    ___DEFINE_AND_DESCRIBE_FLEX_C2STRUCT##enabled(name, flexMember, defineMacro)
+#define ___DEFINE_AND_DESCRIBE_FLEX_C2STRUCT__C2_GENERATE_GLOBAL_VARS__(name, flexMember, defineMacro) \
+    defineMacro(name, flexMember) } C2_PACK; namespace {
+#define ___DEFINE_AND_DESCRIBE_FLEX_C2STRUCT(name, flexMember, defineMacro) \
+    defineMacro(name, flexMember) } C2_PACK; \
+    const std::vector<C2FieldDescriptor> C2##name##Struct::FieldList() { return _FIELD_LIST; } \
+    const std::vector<C2FieldDescriptor> C2##name##Struct::_FIELD_LIST = {
 /// \endif
-#endif
+
 
 /**
  * Parameter reflector class.

@@ -27,7 +27,9 @@
 namespace android {
 
 struct C2SoftAac : public SimpleC2Component {
-    C2SoftAac(const char *name, c2_node_id_t id);
+    class IntfImpl;
+
+    C2SoftAac(const char *name, c2_node_id_t id, const std::shared_ptr<IntfImpl> &intfImpl);
     virtual ~C2SoftAac();
 
     // From SimpleC2Component
@@ -48,9 +50,10 @@ private:
         kNumDelayBlocksMax      = 8,
     };
 
+    std::shared_ptr<IntfImpl> mIntf;
+
     HANDLE_AACDECODER mAACDecoder;
     CStreamInfo *mStreamInfo;
-    bool mIsADTS;
     bool mIsFirst;
     size_t mInputBufferCount;
     size_t mOutputBufferCount;

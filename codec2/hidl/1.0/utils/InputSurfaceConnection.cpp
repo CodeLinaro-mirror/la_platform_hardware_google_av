@@ -26,6 +26,8 @@
 #include <C2PlatformSupport.h>
 #include <C2AllocatorGralloc.h>
 
+#include <C2Debug.h>
+#include <C2Config.h>
 #include <C2Component.h>
 #include <C2Work.h>
 #include <C2Buffer.h>
@@ -77,17 +79,55 @@ struct InputSurfaceConnection::Impl : public ComponentWrapper {
         }
         status_t err = source->initCheck();
         if (err != OK) {
-            ALOGE("Impl::init: GBS init failed: %d", err);
+            ALOGE("Impl::init -- GBS init failed: %d", err);
             return false;
         }
+
+        // Query necessary information for GraphicBufferSource::configure() from
+        // the component interface.
+        std::shared_ptr<C2Component> comp = mComp.lock();
+        if (!comp) {
+            ALOGE("Impl::init -- component died.");
+            return false;
+        }
+        std::shared_ptr<C2ComponentInterface> intf = comp->intf();
+        if (!intf) {
+            ALOGE("Impl::init -- null component interface.");
+            return false;
+        }
+
+        // TODO: read settings properly from the interface
+        C2VideoSizeStreamTuning::input inputSize;
+        C2StreamUsageTuning::input usage;
+        c2_status_t c2Status = intf->query_vb(
+                { &inputSize, &usage },
+                {},
+                C2_MAY_BLOCK,
+                nullptr);
+        if (c2Status != C2_OK) {
+            ALOGD("Impl::init -- cannot query information from "
+                    "the component interface: %s.", asString(c2Status));
+            return false;
+        }
+
         // TODO: proper color aspect & dataspace
         android_dataspace dataSpace = HAL_DATASPACE_BT709;
-        // TODO: read settings properly from the interface
+
+        // TODO: use the usage read from intf
+        // uint32_t grallocUsage =
+        //         C2AndroidMemoryUsage(C2MemoryUsage(usage.value)).
+        //         asGrallocUsage();
+        uint32_t grallocUsage =
+                strncmp(intf->getName().c_str(), "c2.android.", 11) == 0 ?
+                GRALLOC_USAGE_SW_READ_OFTEN :
+                GRALLOC_USAGE_HW_VIDEO_ENCODER;
+
         err = source->configure(
-                this, dataSpace, kBufferCount, 1080, 1920,
-                GRALLOC_USAGE_SW_READ_OFTEN);
+                this, dataSpace, kBufferCount,
+                inputSize.width, inputSize.height,
+                grallocUsage);
         if (err != OK) {
-            ALOGE("Impl::init: GBS configure failed: %d", err);
+            ALOGE("Impl::init -- GBS configure failed: %d", err);
             return false;
         }
         for (int32_t i = 0; i < kBufferCount; ++i) {
@@ -97,7 +137,7 @@ struct InputSurfaceConnection::Impl : public ComponentWrapper {
             }
         }
         if (!source->start().isOk()) {
-            ALOGE("Impl::init: GBS start failed");
+            ALOGE("Impl::init -- GBS start failed");
             return false;
         }
         mAllocatorMutex.lock();
@@ -106,7 +146,7 @@ struct InputSurfaceConnection::Impl : public ComponentWrapper {
                 &mAllocator);
         mAllocatorMutex.unlock();
         if (c2err != OK) {
-            ALOGE("Impl::init: failed to fetch gralloc allocator: %d", c2err);
+            ALOGE("Impl::init -- failed to fetch gralloc allocator: %d", c2err);
             return false;
         }
         return true;
@@ -118,12 +158,13 @@ struct InputSurfaceConnection::Impl : public ComponentWrapper {
             const sp<GraphicBuffer>& buffer,
             int64_t timestamp,
             int fenceFd) override {
-        ALOGV("Impl::submitBuffer bufferId = %d", bufferId);
+        ALOGV("Impl::submitBuffer -- bufferId = %d", bufferId);
         // TODO: Use fd to construct fence
         (void)fenceFd;
 
         std::shared_ptr<C2Component> comp = mComp.lock();
         if (!comp) {
+            ALOGW("Impl::submitBuffer -- component died.");
             return NO_INIT;
         }
 
@@ -170,30 +211,18 @@ struct InputSurfaceConnection::Impl : public ComponentWrapper {
             return UNKNOWN_ERROR;
         }
 
-        mLastTimestamp.store(timestamp, std::memory_order_relaxed);
-
         return OK;
     }
 
     virtual status_t submitEos(int32_t /* bufferId */) override {
+        ALOGV("Impl::submitEos");
         std::shared_ptr<C2Component> comp = mComp.lock();
         if (!comp) {
+            ALOGW("Impl::submitEos -- component died.");
             return NO_INIT;
         }
 
-        std::unique_ptr<C2Work> work(new C2Work);
-        work->input.flags = C2FrameData::FLAG_END_OF_STREAM;
-        work->input.ordinal.timestamp = mLastTimestamp.load(
-                std::memory_order_relaxed);
-        work->input.ordinal.frameIndex = mFrameIndex.fetch_add(
-                1, std::memory_order_relaxed);
-        work->input.buffers.clear();
-        work->worklets.clear();
-        work->worklets.emplace_back(new C2Worklet);
-        std::list<std::unique_ptr<C2Work>> items;
-        items.push_back(std::move(work));
-
-        c2_status_t err = comp->queue_nb(&items);
+        c2_status_t err = comp->drain_nb(C2Component::DRAIN_COMPONENT_WITH_EOS);
         return (err == C2_OK) ? OK : UNKNOWN_ERROR;
     }
 
@@ -212,7 +241,6 @@ private:
     // Needed for ComponentWrapper implementation
     std::mutex mAllocatorMutex;
     std::shared_ptr<C2Allocator> mAllocator;
-    std::atomic_int64_t mLastTimestamp;
     std::atomic_uint64_t mFrameIndex;
 };
 
