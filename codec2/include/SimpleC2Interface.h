@@ -18,9 +18,11 @@
 #define SIMPLE_C2_INTERFACE_H_
 
 #include <C2Component.h>
+#include <C2Config.h>
 
 namespace android {
 
+// deprecated - use SimpleInterface
 class SimpleC2Interface : public C2ComponentInterface {
 public:
     class Builder {
