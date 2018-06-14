@@ -29,17 +29,19 @@ namespace media {
 namespace bufferpool {
 
 struct BufferPoolData {
-    uint32_t mId; //BufferId
-    // Handle should be copied to somewhere else, and should be managed there.
-    native_handle_t *mHandle;
+    // For local use, to specify a bufferpool (client connection) for buffers.
+    // Return value from connect#IAccessor(android.hardware.media.bufferpool@1.0).
+    int64_t mConnectionId;
+    // BufferId
+    uint32_t mId;
 
-    BufferPoolData() : mId(0), mHandle(NULL) {}
+    BufferPoolData() : mConnectionId(0), mId(0) {}
 
-    BufferPoolData(uint32_t id, native_handle_t *handle)
-            : mId(id), mHandle(handle) {}
+    BufferPoolData(
+            int64_t connectionId, uint32_t id)
+            : mConnectionId(connectionId), mId(id) {}
 
-    ~BufferPoolData() {
-    }
+    ~BufferPoolData() {}
 };
 
 namespace V1_0 {
@@ -50,6 +52,10 @@ using ::android::hardware::kSynchronizedReadWrite;
 typedef uint32_t BufferId;
 typedef uint64_t TransactionId;
 typedef int64_t ConnectionId;
+
+enum : ConnectionId {
+    INVALID_CONNECTIONID = 0,
+};
 
 typedef android::hardware::MessageQueue<BufferStatusMessage, kSynchronizedReadWrite> BufferStatusQueue;
 typedef BufferStatusQueue::Descriptor QueueDescriptor;
@@ -80,12 +86,14 @@ public:
      *
      * @param params    allocation parameters
      * @param alloc     created allocation
+     * @param allocSize size of created allocation
      *
      * @return OK when an allocation is created successfully.
      */
     virtual ResultStatus allocate(
             const std::vector<uint8_t> &params,
-            std::shared_ptr<BufferPoolAllocation> *alloc) = 0;
+            std::shared_ptr<BufferPoolAllocation> *alloc,
+            size_t *allocSize) = 0;
 
     /**
      * Returns whether allocation parameters of an old allocation are

@@ -26,7 +26,7 @@
 
 //#define LOG_NDEBUG 0
 #define LOG_TAG "codec2"
-#include <media/stagefright/foundation/ADebug.h>
+#include <log/log.h>
 
 #include <binder/IServiceManager.h>
 #include <binder/ProcessState.h>
@@ -51,11 +51,12 @@
 #include <gui/Surface.h>
 #include <gui/SurfaceComposerClient.h>
 
-#include <util/C2ParamUtils.h>
 #include <C2AllocatorGralloc.h>
 #include <C2Buffer.h>
 #include <C2BufferPriv.h>
 #include <C2Component.h>
+#include <C2Config.h>
+#include <C2Debug.h>
 #include <C2PlatformSupport.h>
 #include <C2Work.h>
 
@@ -214,7 +215,7 @@ void SimplePlayer::play(const sp<IMediaSource> &source) {
 
     std::shared_ptr<C2ComponentStore> store = GetCodec2PlatformComponentStore();
     std::shared_ptr<C2Component> component;
-    (void)store->createComponent("c2.google.avc.decoder", &component);
+    (void)store->createComponent("c2.android.avc.decoder", &component);
 
     (void)component->setListener_vb(mListener, C2_DONT_BLOCK);
     std::unique_ptr<C2PortBlockPoolsTuning::output> pools =

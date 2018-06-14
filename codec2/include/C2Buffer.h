@@ -1986,18 +1986,20 @@ public:
     /**
      *  The type of buffer data.
      */
-    enum Type : uint32_t {
+    enum type_t : uint32_t {
+        INVALID,            ///< invalid buffer type. Do not use.
         LINEAR,             ///< the buffer contains a single linear block
         LINEAR_CHUNKS,      ///< the buffer contains one or more linear blocks
         GRAPHIC,            ///< the buffer contains a single graphic block
         GRAPHIC_CHUNKS,     ///< the buffer contains one of more graphic blocks
     };
+    typedef type_t Type; // deprecated
 
     /**
      * Gets the type of this buffer (data).
      * \return the type of this buffer data.
      */
-    Type type() const;
+    type_t type() const;
 
     /**
      * Gets the linear blocks of this buffer.
@@ -2124,6 +2126,17 @@ public:
      * \return true iff there is a metadata with the parameter type attached to this buffer.
      */
     bool hasInfo(C2Param::Type index) const;
+
+    /**
+     * Checks if there is a certain type of metadata attached to this buffer, and returns a
+     * shared pointer to it if there is. Returns an empty shared pointer object (nullptr) if there
+     * is not.
+     *
+     * \param index the parameter type of the metadata
+     *
+     * \return shared pointer to the metadata.
+     */
+    std::shared_ptr<const C2Info> getInfo(C2Param::Type index) const;
 
     /**
      * Removes a metadata from the buffer.

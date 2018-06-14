@@ -1,10 +1,6 @@
 cc_test {
     name: "codec2_param_test",
 
-    tags: [
-        "tests",
-    ],
-
     srcs: [
         "C2Param_test.cpp",
     ],
@@ -31,15 +27,11 @@ cc_test {
 cc_test {
     name: "codec2_test",
 
-    tags: [
-        "tests",
-    ],
-
     srcs: [
         "C2_test.cpp",
         "C2SampleComponent_test.cpp",
+        "C2UtilTest.cpp",
         "vndk/C2BufferTest.cpp",
-        "vndk/C2UtilTest.cpp",
     ],
 
     include_dirs: [
@@ -62,10 +54,6 @@ cc_test {
 
 cc_test {
     name: "codec2_interface_test",
-
-    tags: [
-        "tests",
-    ],
 
     srcs: [
         "C2ComponentInterface_test.cpp",
