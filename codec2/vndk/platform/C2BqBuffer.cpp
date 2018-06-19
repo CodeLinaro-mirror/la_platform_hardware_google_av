@@ -35,42 +35,100 @@ using ::android::Fence;
 using ::android::GraphicBuffer;
 using ::android::HGraphicBufferProducer;
 using ::android::IGraphicBufferProducer;
+using ::android::hardware::graphics::common::V1_0::PixelFormat;
 using ::android::hidl_handle;
 using ::android::sp;
 using ::android::status_t;
-using ::android::hardware::graphics::common::V1_0::PixelFormat;
+using ::android::wp;
 
-struct C2_HIDE C2BufferQueueBlockPoolData : public _C2BlockPoolData {
+struct C2BufferQueueBlockPoolData : public _C2BlockPoolData {
+
+    bool held;
+    bool local;
+    uint64_t bqId;
+    int32_t bqSlot;
+    sp<HGraphicBufferProducer> igbp;
+    std::shared_ptr<C2BufferQueueBlockPool::Impl> localPool;
 
     virtual type_t getType() const override {
         return TYPE_BUFFERQUEUE;
     }
 
-    void getBufferQueueData(uint64_t *igbp_id, int32_t *igbp_slot) const {
-        *igbp_id = mIgbpId;
-        *igbp_slot = mIgbpSlot;
-    }
+    // Create a remote BlockPoolData.
+    C2BufferQueueBlockPoolData(
+            uint64_t bqId, int32_t bqSlot,
+            const sp<HGraphicBufferProducer>& producer = nullptr);
 
-    C2BufferQueueBlockPoolData(uint64_t igbp_id, int32_t igbp_slot)
-            : mIgbpId(igbp_id), mIgbpSlot(igbp_slot) {}
+    // Create a local BlockPoolData.
+    C2BufferQueueBlockPoolData(
+            uint64_t bqId, int32_t bqSlot,
+            const std::shared_ptr<C2BufferQueueBlockPool::Impl>& pool);
 
-    virtual ~C2BufferQueueBlockPoolData() override {}
+    virtual ~C2BufferQueueBlockPoolData() override;
 
-private:
-    uint64_t mIgbpId;
-    int32_t mIgbpSlot;
 };
 
 bool _C2BlockFactory::GetBufferQueueData(
-        const std::shared_ptr<const _C2BlockPoolData> &data,
-        uint64_t *igbp_id, int32_t *igbp_slot) {
+        const std::shared_ptr<_C2BlockPoolData>& data,
+        uint64_t* bqId, int32_t* bqSlot) {
     if (data && data->getType() == _C2BlockPoolData::TYPE_BUFFERQUEUE) {
-        const std::shared_ptr<const C2BufferQueueBlockPoolData> poolData =
-                std::static_pointer_cast<const C2BufferQueueBlockPoolData>(data);
-        poolData->getBufferQueueData(igbp_id, igbp_slot);
+        if (bqId) {
+            const std::shared_ptr<C2BufferQueueBlockPoolData> poolData =
+                    std::static_pointer_cast<C2BufferQueueBlockPoolData>(data);
+            *bqId = poolData->bqId;
+            if (bqSlot) {
+                *bqSlot = poolData->bqSlot;
+            }
+        }
         return true;
     }
     return false;
+}
+
+bool _C2BlockFactory::AssignBlockToBufferQueue(
+        const std::shared_ptr<_C2BlockPoolData>& data,
+        const sp<HGraphicBufferProducer>& igbp,
+        uint64_t bqId,
+        int32_t bqSlot,
+        bool held) {
+    if (data && data->getType() == _C2BlockPoolData::TYPE_BUFFERQUEUE) {
+        const std::shared_ptr<C2BufferQueueBlockPoolData> poolData =
+                std::static_pointer_cast<C2BufferQueueBlockPoolData>(data);
+        poolData->igbp = igbp;
+        poolData->bqId = bqId;
+        poolData->bqSlot = bqSlot;
+        poolData->held = held;
+        return true;
+    }
+    return false;
+}
+
+bool _C2BlockFactory::HoldBlockFromBufferQueue(
+        const std::shared_ptr<_C2BlockPoolData>& data,
+        const sp<HGraphicBufferProducer>& igbp) {
+    const std::shared_ptr<C2BufferQueueBlockPoolData> poolData =
+            std::static_pointer_cast<C2BufferQueueBlockPoolData>(data);
+    if (!poolData->local) {
+        poolData->igbp = igbp;
+    }
+    if (poolData->held) {
+        poolData->held = true;
+        return false;
+    }
+    poolData->held = true;
+    return true;
+}
+
+bool _C2BlockFactory::YieldBlockToBufferQueue(
+        const std::shared_ptr<_C2BlockPoolData>& data) {
+    const std::shared_ptr<C2BufferQueueBlockPoolData> poolData =
+            std::static_pointer_cast<C2BufferQueueBlockPoolData>(data);
+    if (!poolData->held) {
+        poolData->held = false;
+        return false;
+    }
+    poolData->held = false;
+    return true;
 }
 
 std::shared_ptr<C2GraphicBlock> _C2BlockFactory::CreateGraphicBlock(
@@ -92,11 +150,11 @@ std::shared_ptr<C2GraphicBlock> _C2BlockFactory::CreateGraphicBlock(
         c2_status_t err = sAllocator->priorGraphicAllocation(handle, &alloc);
         if (err == C2_OK) {
             std::shared_ptr<C2GraphicBlock> block;
-            if (!igbp_id || !igbp_slot) {
+            if (igbp_id || igbp_slot) {
                 // BQBBP
                 std::shared_ptr<C2BufferQueueBlockPoolData> poolData =
                         std::make_shared<C2BufferQueueBlockPoolData>(igbp_id, (int32_t)igbp_slot);
-                block = _C2BlockFactory::CreateGraphicBlock(alloc);
+                block = _C2BlockFactory::CreateGraphicBlock(alloc, poolData);
             } else {
                 block = _C2BlockFactory::CreateGraphicBlock(alloc);
             }
@@ -106,7 +164,8 @@ std::shared_ptr<C2GraphicBlock> _C2BlockFactory::CreateGraphicBlock(
     return nullptr;
 }
 
-class C2BufferQueueBlockPool::Impl {
+class C2BufferQueueBlockPool::Impl
+        : public std::enable_shared_from_this<C2BufferQueueBlockPool::Impl> {
 private:
     c2_status_t fetchFromIgbp_l(
             uint32_t width,
@@ -153,11 +212,23 @@ private:
         if (fence) {
             static constexpr int kFenceWaitTimeMs = 10;
 
-            status = fence->wait(kFenceWaitTimeMs);
+            status_t status = fence->wait(kFenceWaitTimeMs);
+            if (status == -ETIME) {
+                // fence is not signalled yet.
+                mProducer->cancelBuffer(slot, fenceHandle);
+                return C2_TIMED_OUT;
+            }
             if (status != android::NO_ERROR) {
                 ALOGD("buffer fence wait error %d", status);
                 mProducer->cancelBuffer(slot, fenceHandle);
                 return C2_BAD_VALUE;
+            } else if (mRenderCallback) {
+                nsecs_t signalTime = fence->getSignalTime();
+                if (signalTime >= 0 && signalTime < INT64_MAX) {
+                    mRenderCallback(mProducerId, slot, signalTime);
+                } else {
+                    ALOGV("got fence signal time of %lld", (long long)signalTime);
+                }
             }
         }
 
@@ -198,16 +269,21 @@ private:
                         mBuffers[slot]->stride,
                         mProducerId, slot);
                 if (c2Handle) {
+                    // Moved everything to c2Handle.
+                    native_handle_delete(grallocHandle);
                     std::shared_ptr<C2GraphicAllocation> alloc;
                     c2_status_t err = mAllocator->priorGraphicAllocation(c2Handle, &alloc);
                     if (err != C2_OK) {
                         return err;
                     }
                     std::shared_ptr<C2BufferQueueBlockPoolData> poolData =
-                            std::make_shared<C2BufferQueueBlockPoolData>(mProducerId, slot);
+                            std::make_shared<C2BufferQueueBlockPoolData>(
+                                    mProducerId, slot, shared_from_this());
                     *block = _C2BlockFactory::CreateGraphicBlock(alloc, poolData);
                     return C2_OK;
                 }
+                native_handle_close(grallocHandle);
+                native_handle_delete(grallocHandle);
             }
             // Block was not created. call requestBuffer# again next time.
             mBuffers[slot].clear();
@@ -221,7 +297,16 @@ public:
         : mInit(C2_OK), mProducerId(0), mAllocator(allocator) {
     }
 
-    ~Impl() {}
+    ~Impl() {
+        std::lock_guard<std::mutex> lock(mMutex);
+        bool noInit = false;
+        for (int i = 0; i < NUM_BUFFER_SLOTS; ++i) {
+            if (!noInit && mProducer) {
+                noInit = mProducer->detachBuffer(i) == android::NO_INIT;
+            }
+            mBuffers[i].clear();
+        }
+    }
 
     c2_status_t fetchGraphicBlock(
             uint32_t width,
@@ -250,7 +335,8 @@ public:
                     return err;
                 }
                 std::shared_ptr<C2BufferQueueBlockPoolData> poolData =
-                        std::make_shared<C2BufferQueueBlockPoolData>((uint64_t)0, ~0);
+                        std::make_shared<C2BufferQueueBlockPoolData>(
+                                (uint64_t)0, ~0, shared_from_this());
                 // TODO: config?
                 *block = _C2BlockFactory::CreateGraphicBlock(alloc, poolData);
                 ALOGV("allocated a buffer successfully");
@@ -268,32 +354,58 @@ public:
         return C2_TIMED_OUT;
     }
 
-    void configureProducer(const sp<HGraphicBufferProducer> &producer) {
+    void setRenderCallback(const OnRenderCallback &renderCallback) {
         std::lock_guard<std::mutex> lock(mMutex);
-        mProducer = producer;
+        mRenderCallback = renderCallback;
+    }
+
+    void configureProducer(const sp<HGraphicBufferProducer> &producer) {
+        int32_t status = android::OK;
+        uint64_t producerId = 0;
         if (producer) {
-            int32_t status;
-            uint64_t &producerId = mProducerId;
             producer->getUniqueId(
                     [&status, &producerId](int32_t tStatus, int64_t tProducerId) {
                 status = tStatus;
                 producerId = tProducerId;
                     });
-            if (status != android::OK) {
+        }
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            if (status == android::OK && producerId == mProducerId) {
+                // producer is not changed.
+                return;
+            }
+            bool noInit = false;
+            for (int i = 0; i < NUM_BUFFER_SLOTS; ++i) {
+                if (!noInit && mProducer) {
+                    noInit = mProducer->detachBuffer(i) == android::NO_INIT;
+                }
+                mBuffers[i].clear();
+            }
+            if (producer && status == android::OK) {
+                mProducer = producer;
+                mProducerId = producerId;
+            } else {
                 mProducer = nullptr;
                 mProducerId = 0;
             }
-
-        } else {
-            mProducerId = 0;
-        }
-        for (int i = 0; i < NUM_BUFFER_SLOTS; ++i) {
-            mBuffers[i].clear();
         }
     }
+
 private:
+    friend struct C2BufferQueueBlockPoolData;
+
+    void cancel(uint64_t igbp_id, int32_t igbp_slot) {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (igbp_id == mProducerId && mProducer) {
+            mProducer->cancelBuffer(igbp_slot, nullptr);
+        }
+    }
+
     c2_status_t mInit;
     uint64_t mProducerId;
+    OnRenderCallback mRenderCallback;
+
     const std::shared_ptr<C2Allocator> mAllocator;
 
     std::mutex mMutex;
@@ -301,6 +413,35 @@ private:
 
     sp<GraphicBuffer> mBuffers[NUM_BUFFER_SLOTS];
 };
+
+C2BufferQueueBlockPoolData::C2BufferQueueBlockPoolData(
+        uint64_t bqId, int32_t bqSlot,
+        const sp<HGraphicBufferProducer>& producer) :
+        held(producer && bqId != 0), local(false),
+        bqId(bqId), bqSlot(bqSlot),
+        igbp(producer),
+        localPool() {
+}
+
+C2BufferQueueBlockPoolData::C2BufferQueueBlockPoolData(
+        uint64_t bqId, int32_t bqSlot,
+        const std::shared_ptr<C2BufferQueueBlockPool::Impl>& pool) :
+        held(true), local(true),
+        bqId(bqId), bqSlot(bqSlot),
+        igbp(pool ? pool->mProducer : nullptr),
+        localPool(pool) {
+}
+
+C2BufferQueueBlockPoolData::~C2BufferQueueBlockPoolData() {
+    if (!held || bqId == 0) {
+        return;
+    }
+    if (local && localPool) {
+        localPool->cancel(bqId, bqSlot);
+    } else if (igbp) {
+        igbp->cancelBuffer(bqSlot, nullptr);
+    }
+}
 
 C2BufferQueueBlockPool::C2BufferQueueBlockPool(
         const std::shared_ptr<C2Allocator> &allocator, const local_id_t localId)
@@ -323,5 +464,11 @@ c2_status_t C2BufferQueueBlockPool::fetchGraphicBlock(
 void C2BufferQueueBlockPool::configureProducer(const sp<HGraphicBufferProducer> &producer) {
     if (mImpl) {
         mImpl->configureProducer(producer);
+    }
+}
+
+void C2BufferQueueBlockPool::setRenderCallback(const OnRenderCallback &renderCallback) {
+    if (mImpl) {
+        mImpl->setRenderCallback(renderCallback);
     }
 }

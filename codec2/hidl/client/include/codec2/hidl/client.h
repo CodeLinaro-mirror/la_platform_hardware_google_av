@@ -17,6 +17,7 @@
 #ifndef CODEC2_HIDL_CLIENT_H_
 #define CODEC2_HIDL_CLIENT_H_
 
+#include <gui/IGraphicBufferProducer.h>
 #include <codec2/hidl/1.0/types.h>
 
 #include <C2PlatformSupport.h>
@@ -28,6 +29,7 @@
 #include <hidl/HidlSupport.h>
 #include <utils/StrongPointer.h>
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -93,7 +95,6 @@ struct IClientManager;
 
 // Forward declarations of other classes
 namespace android {
-class IGraphicBufferProducer;
 namespace hardware {
 namespace graphics {
 namespace bufferqueue {
@@ -171,6 +172,8 @@ struct Codec2Client : public Codec2ConfigurableClient {
 
     typedef Codec2Client Store;
 
+    std::string getInstanceName() const { return mInstanceName; }
+
     c2_status_t createComponent(
             const C2String& name,
             const std::shared_ptr<Listener>& listener,
@@ -202,17 +205,31 @@ struct Codec2Client : public Codec2ConfigurableClient {
             const std::shared_ptr<Listener>& listener,
             std::shared_ptr<Codec2Client>* owner = nullptr);
 
+    // Try to create a component interface with a given name from all known
+    // IComponentStore services.
+    static std::shared_ptr<Interface> CreateInterfaceByName(
+            const char* interfaceName,
+            std::shared_ptr<Codec2Client>* owner = nullptr);
+
     // List traits from all known IComponentStore services.
     static const std::vector<C2Component::Traits>& ListComponents();
 
     // base cannot be null.
-    Codec2Client(const sp<Base>& base);
+    Codec2Client(const sp<Base>& base, std::string instanceName);
 
 protected:
     Base* base() const;
 
+    // Finds the first store where the predicate returns OK, and returns the last
+    // predicate result. Uses key to remember the last store found, and if cached,
+    // it tries that store before trying all stores (one retry).
+    static c2_status_t ForAllStores(
+            const std::string& key,
+            std::function<c2_status_t(const std::shared_ptr<Codec2Client>&)> predicate);
+
     mutable std::mutex mMutex;
     mutable bool mListed;
+    std::string mInstanceName;
     mutable std::vector<C2Component::Traits> mTraitsList;
     mutable std::vector<std::unique_ptr<std::vector<std::string>>>
             mAliasesBuffer;
@@ -281,24 +298,53 @@ struct Codec2Client::Component : public Codec2Client::Configurable {
 
     c2_status_t release();
 
-    typedef ::android::hardware::graphics::bufferqueue::V1_0::
+    typedef ::android::
             IGraphicBufferProducer IGraphicBufferProducer;
-    typedef ::android::hardware::media::omx::V1_0::
-            IGraphicBufferSource IGraphicBufferSource;
+    typedef IGraphicBufferProducer::
+            QueueBufferInput QueueBufferInput;
+    typedef IGraphicBufferProducer::
+            QueueBufferOutput QueueBufferOutput;
 
-    // Output surface
+    typedef ::android::hardware::graphics::bufferqueue::V1_0::
+            IGraphicBufferProducer HGraphicBufferProducer;
+    typedef ::android::hardware::media::omx::V1_0::
+            IGraphicBufferSource HGraphicBufferSource;
+
+    // Set the output surface to be used with a blockpool previously created by
+    // createBlockPool().
     c2_status_t setOutputSurface(
             C2BlockPool::local_id_t blockPoolId,
-            const sp<IGraphicBufferProducer>& surface);
+            const sp<IGraphicBufferProducer>& surface,
+            uint32_t generation);
+
+    // Extract a slot number from of the block, then call
+    // IGraphicBufferProducer::queueBuffer().
+    //
+    // If the output surface has not been set, NO_INIT will be returned.
+    //
+    // If the block does not come from a bufferqueue-based blockpool,
+    // attachBuffer() will be called, followed by queueBuffer().
+    //
+    // If the block has a bqId that does not match the id of the output surface,
+    // DEAD_OBJECT will be returned.
+    //
+    // If the call to queueBuffer() is successful but the block cannot be
+    // associated to the output surface for automatic cancellation upon
+    // destruction, UNKNOWN_ERROR will be returned.
+    //
+    // Otherwise, the return value from queueBuffer() will be returned.
+    status_t queueToOutputSurface(
+            const C2ConstGraphicBlock& block,
+            const QueueBufferInput& input,
+            QueueBufferOutput* output);
 
     c2_status_t connectToOmxInputSurface(
-            const sp<IGraphicBufferProducer>& producer,
-            const sp<IGraphicBufferSource>& source);
+            const sp<HGraphicBufferProducer>& producer,
+            const sp<HGraphicBufferSource>& source);
 
     c2_status_t disconnectFromInputSurface();
 
-    // Input buffer lifetime management
-    void handleOnWorkDone(const std::vector<uint64_t> &inputDone);
+    void handleOnWorkDone(const std::list<std::unique_ptr<C2Work>> &workItems);
 
     // base cannot be null.
     Component(const sp<Base>& base);
@@ -314,6 +360,11 @@ protected:
 
     ::hardware::google::media::c2::V1_0::utils::DefaultBufferPoolSender
             mBufferPoolSender;
+
+    std::mutex mOutputBufferQueueMutex;
+    sp<IGraphicBufferProducer> mOutputIgbp;
+    uint64_t mOutputBqId;
+    uint32_t mOutputGeneration;
 
     static c2_status_t setDeathListener(
             const std::shared_ptr<Component>& component,

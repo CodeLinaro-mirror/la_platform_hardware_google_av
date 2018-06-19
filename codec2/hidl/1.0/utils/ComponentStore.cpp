@@ -27,11 +27,25 @@
 #include <media/stagefright/bqhelper/WGraphicBufferProducer.h>
 #include <media/stagefright/bqhelper/GraphicBufferSource.h>
 
-#include <hidl/HidlBinderSupport.h>
-
 #include <C2PlatformSupport.h>
 
 #include <utils/Errors.h>
+
+#include <android-base/file.h>
+
+#ifdef LOG
+#undef LOG
+#endif
+
+#ifdef PLOG
+#undef PLOG
+#endif
+
+#include <android-base/logging.h>
+
+#include <ostream>
+#include <sstream>
+#include <iomanip>
 
 namespace hardware {
 namespace google {
@@ -41,7 +55,6 @@ namespace V1_0 {
 namespace utils {
 
 using namespace ::android;
-using ::android::hardware::toBinder;
 using ::android::GraphicBufferSource;
 using namespace ::android::hardware::media::bufferpool::V1_0::implementation;
 
@@ -154,6 +167,7 @@ Return<void> ComponentStore::createComponent(
             mStore->createComponent(name, &c2component));
 
     if (status == Status::OK) {
+        onInterfaceLoaded(c2component->intf());
         component = new Component(c2component, listener, this, pool);
         if (!component) {
             status = Status::CORRUPTED;
@@ -167,7 +181,8 @@ Return<void> ComponentStore::createComponent(
                 std::lock_guard<std::mutex> lock(mComponentRosterMutex);
                 component->setLocalId(
                         mComponentRoster.emplace(
-                            toBinder(component), c2component)
+                            Component::InterfaceKey(component),
+                            c2component)
                         .first);
             }
         }
@@ -183,6 +198,7 @@ Return<void> ComponentStore::createInterface(
     c2_status_t res = mStore->createInterface(name, &c2interface);
     sp<IComponentInterface> interface;
     if (res == C2_OK) {
+        onInterfaceLoaded(c2interface);
         interface = new ComponentInterface(c2interface, this);
     }
     _hidl_cb((Status)res, interface);
@@ -218,6 +234,16 @@ Return<sp<IInputSurface>> ComponentStore::createInputSurface() {
             source);
 }
 
+void ComponentStore::onInterfaceLoaded(const std::shared_ptr<C2ComponentInterface> &intf) {
+    // invalidate unsupported struct descriptors if a new interface is loaded as it may have
+    // exposed new descriptors
+    std::lock_guard<std::mutex> lock(mStructDescriptorsMutex);
+    if (!mLoadedInterfaces.count(intf->getName())) {
+        mUnsupportedStructDescriptors.clear();
+        mLoadedInterfaces.emplace(intf->getName());
+    }
+}
+
 Return<void> ComponentStore::getStructDescriptors(
         const hidl_vec<uint32_t>& indices,
         getStructDescriptors_cb _hidl_cb) {
@@ -226,9 +252,21 @@ Return<void> ComponentStore::getStructDescriptors(
     Status res = Status::OK;
     for (size_t srcIx = 0; srcIx < indices.size(); ++srcIx) {
         std::lock_guard<std::mutex> lock(mStructDescriptorsMutex);
-        const auto item = mStructDescriptors.find(
-                C2Param::CoreIndex(indices[srcIx]).coreIndex());
+        const C2Param::CoreIndex coreIndex = C2Param::CoreIndex(indices[srcIx]).coreIndex();
+        const auto item = mStructDescriptors.find(coreIndex);
         if (item == mStructDescriptors.end()) {
+            // not in the cache, and not known to be unsupported, query local reflector
+            if (!mUnsupportedStructDescriptors.count(coreIndex)) {
+                std::shared_ptr<C2StructDescriptor> structDesc =
+                    mParamReflector->describe(coreIndex);
+                if (!structDesc) {
+                    mUnsupportedStructDescriptors.emplace(coreIndex);
+                } else {
+                    mStructDescriptors.insert({ coreIndex, structDesc });
+                    objcpy(&descriptors[dstIx++], *structDesc);
+                    continue;
+                }
+            }
             res = Status::NOT_FOUND;
         } else if (item->second) {
             objcpy(&descriptors[dstIx++], *item->second);
@@ -259,14 +297,134 @@ void ComponentStore::reportComponentDeath(
 }
 
 std::shared_ptr<C2Component> ComponentStore::findC2Component(
-        const wp<IBinder>& binder) const {
+        const sp<IComponent>& component) const {
     std::lock_guard<std::mutex> lock(mComponentRosterMutex);
-    Component::LocalId it = mComponentRoster.find(binder);
+    Component::LocalId it = mComponentRoster.find(
+            Component::InterfaceKey(component));
     if (it == mComponentRoster.end()) {
         return std::shared_ptr<C2Component>();
     }
     return it->second.lock();
 }
+
+// Debug dump
+
+namespace /* unnamed */ {
+
+// Dump component traits
+std::ostream& dump(
+        std::ostream& out,
+        const std::shared_ptr<const C2Component::Traits>& comp) {
+
+    constexpr const char indent[] = "    ";
+
+    out << indent << "name: " << comp->name << std::endl;
+    out << indent << "domain: " << comp->domain << std::endl;
+    out << indent << "kind: " << comp->kind << std::endl;
+    out << indent << "rank: " << comp->rank << std::endl;
+    out << indent << "mediaType: " << comp->mediaType << std::endl;
+    out << indent << "aliases:";
+    for (const auto& alias : comp->aliases) {
+        out << ' ' << alias;
+    }
+    out << std::endl;
+
+    return out;
+}
+
+// Dump component
+std::ostream& dump(
+        std::ostream& out,
+        const std::shared_ptr<C2Component>& comp) {
+
+    constexpr const char indent[] = "    ";
+
+    std::shared_ptr<C2ComponentInterface> intf = comp->intf();
+    if (!intf) {
+        out << indent << "Unknown -- null interface" << std::endl;
+        return out;
+    }
+    out << indent << "name: " << intf->getName() << std::endl;
+    out << indent << "id: " << intf->getId() << std::endl;
+    return out;
+}
+
+} // unnamed namespace
+
+Return<void> ComponentStore::debug(
+        const hidl_handle& handle,
+        const hidl_vec<hidl_string>& /* args */) {
+   LOG(INFO) << "debug -- dumping...";
+   const native_handle_t *h = handle.getNativeHandle();
+   if (!h || h->numFds != 1) {
+      LOG(ERROR) << "debug -- dumping failed -- "
+              "invalid file descriptor to dump to";
+      return Void();
+   }
+   std::ostringstream out;
+
+   { // Populate "out".
+
+        constexpr const char indent[] = "  ";
+
+        // Show name.
+        out << "Beginning of dump -- C2ComponentStore: "
+                << mStore->getName() << std::endl << std::endl;
+
+        // Retrieve the list of supported components.
+        std::vector<std::shared_ptr<const C2Component::Traits>> traitsList =
+                mStore->listComponents();
+
+        // Dump the traits of supported components.
+        out << indent << "Supported components:" << std::endl << std::endl;
+        if (traitsList.size() == 0) {
+            out << indent << indent << "NONE" << std::endl << std::endl;
+        } else {
+            for (const auto& traits : traitsList) {
+                dump(out, traits) << std::endl;
+            }
+        }
+
+        // Retrieve the list of active components.
+        std::list<std::shared_ptr<C2Component>> activeComps;
+        {
+            std::lock_guard<std::mutex> lock(mComponentRosterMutex);
+            auto i = mComponentRoster.begin();
+            while (i != mComponentRoster.end()) {
+                std::shared_ptr<C2Component> c2comp = i->second.lock();
+                if (!c2comp) {
+                    auto j = i;
+                    ++i;
+                    mComponentRoster.erase(j);
+                } else {
+                    ++i;
+                    activeComps.emplace_back(c2comp);
+                }
+            }
+        }
+
+        // Dump active components.
+        out << indent << "Active components:" << std::endl << std::endl;
+        if (activeComps.size() == 0) {
+            out << indent << indent << "NONE" << std::endl << std::endl;
+        } else {
+            for (const std::shared_ptr<C2Component>& c2comp : activeComps) {
+                dump(out, c2comp) << std::endl;
+            }
+        }
+
+        out << "End of dump -- C2ComponentStore: "
+                << mStore->getName() << std::endl;
+   }
+
+   if (!android::base::WriteStringToFd(out.str(), h->data[0])) {
+       PLOG(WARNING) << "debug -- dumping failed -- write()";
+   } else {
+       LOG(INFO) << "debug -- dumping succeeded";
+   }
+   return Void();
+}
+
 
 }  // namespace utils
 }  // namespace V1_0

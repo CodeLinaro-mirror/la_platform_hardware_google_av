@@ -211,6 +211,7 @@ enum C2ParamIndexKind : C2Param::type_index_t {
     kParamIndexAspectsToDataSpace, // store, struct
     kParamIndexDataSpaceToAspects, // store, struct
     kParamIndexDataSpace, // u32
+    kParamIndexSurfaceScaling, // u32
 
     // input surface
     kParamIndexInputSurfaceEos, // input-surface, eos
@@ -307,7 +308,7 @@ constexpr char C2_PARAMKEY_COMPONENT_ALIASES[]  = "component.aliases";
  * Component kind.
  */
 // read-only
-typedef C2GlobalParam<C2Setting, C2SimpleValueStruct<C2Component::kind_t>, kParamIndexDomain>
+typedef C2GlobalParam<C2Setting, C2SimpleValueStruct<C2Component::kind_t>, kParamIndexKind>
         C2ComponentKindSetting;
 constexpr char C2_PARAMKEY_COMPONENT_KIND[]  = "component.kind";
 
@@ -637,6 +638,11 @@ enum C2Config::level_t : uint32_t {
 struct C2ProfileLevelStruct {
     C2Config::profile_t profile;  ///< coding profile
     C2Config::level_t   level;    ///< coding level
+
+    C2ProfileLevelStruct(
+            C2Config::profile_t profile_ = C2Config::PROFILE_UNUSED,
+            C2Config::level_t level_ = C2Config::LEVEL_UNUSED)
+        : profile(profile_), level(level_) { }
 
     DEFINE_AND_DESCRIBE_C2STRUCT(ProfileLevel)
     C2FIELD(profile, "profile")
@@ -996,7 +1002,7 @@ constexpr char C2_PARAMKEY_OUTPUT_MAX_BUFFER_SIZE[] = "output.buffers.max-size";
  * interface operations, as well as to allow client to trip the component on demand.
  */
 typedef C2GlobalParam<C2Tuning, C2BoolValue, kParamIndexTripped>
-        C2TrippedTunning;
+        C2TrippedTuning;
 constexpr char C2_PARAMKEY_TRIPPED[] = "algo.tripped";
 
 /**
@@ -1167,6 +1173,12 @@ constexpr char C2_PARAMKEY_PREPEND_HEADER_MODE[] = "output.buffers.prepend-heade
 
 /* =================================== IMAGE/VIDEO COMPONENTS =================================== */
 
+/*
+ * Order of transformation is:
+ *
+ * crop => (scaling => scaled-crop) => sample-aspect-ratio => flip => rotation
+ */
+
 /**
  * Picture (image- and video frame) size.
  *
@@ -1189,6 +1201,9 @@ struct C2RectStruct : C2Rect {
     C2RectStruct() = default;
     C2RectStruct(const C2Rect &rect) : C2Rect(rect) { }
 
+    bool operator==(const C2RectStruct &) = delete;
+    bool operator!=(const C2RectStruct &) = delete;
+
     DEFINE_AND_DESCRIBE_BASE_C2STRUCT(Rect)
     C2FIELD(width, "width")
     C2FIELD(height, "height")
@@ -1209,9 +1224,23 @@ typedef C2StreamParam<C2Info, C2Uint32Value, kParamIndexPixelFormat> C2StreamPix
 constexpr char C2_PARAMKEY_PIXEL_FORMAT[] = "raw.pixel-format";
 
 /**
- * Rotation (counter clock-wise).
+ * Extended rotation information also incorporating a flip.
+ *
+ * Rotation is counter clock-wise.
  */
-typedef C2StreamParam<C2Info, C2Int32Value, kParamIndexRotation> C2StreamRotationInfo;
+struct C2RotationStruct {
+    C2RotationStruct(int32_t rotation = 0)
+        : flip(0), value(rotation) { }
+
+    int32_t flip;   ///< horizontal flip (left-right flip applied prior to rotation)
+    int32_t value;  ///< rotation in degrees counter clockwise
+
+    DEFINE_AND_DESCRIBE_BASE_C2STRUCT(Rotation)
+    C2FIELD(flip, "flip")
+    C2FIELD(value, "value")
+};
+
+typedef C2StreamParam<C2Info, C2RotationStruct, kParamIndexRotation> C2StreamRotationInfo;
 constexpr char C2_PARAMKEY_ROTATION[] = "raw.rotation";
 constexpr char C2_PARAMKEY_VUI_ROTATION[] = "coded.vui.rotation";
 
@@ -1301,6 +1330,25 @@ struct C2ColorInfoStruct {
     C2Color::subsampling_t subsampling;
     C2ChromaOffsetStruct locations[]; // max 2 elements
 
+    C2ColorInfoStruct(
+            size_t /* flexCount */, uint32_t bitDepth_, C2Color::subsampling_t subsampling_)
+        : bitDepth(bitDepth_), subsampling(subsampling_) {
+    }
+
+    C2ColorInfoStruct(
+            size_t flexCount, uint32_t bitDepth_, C2Color::subsampling_t subsampling_,
+            std::initializer_list<C2ChromaOffsetStruct> locations_)
+        : bitDepth(bitDepth_), subsampling(subsampling_) {
+        size_t ix = 0;
+        for (const C2ChromaOffsetStruct &location : locations_) {
+            if (ix == flexCount) {
+                break;
+            }
+            locations[ix] = location;
+            ++ix;
+        }
+    }
+
     DEFINE_AND_DESCRIBE_FLEX_C2STRUCT(ColorInfo, locations)
     C2FIELD(bitDepth, "bit-depth")
     C2FIELD(subsampling, "subsampling")
@@ -1367,9 +1415,9 @@ C2ENUM(C2Color::transfer_t, uint32_t,
 /// Matrix coefficient
 C2ENUM(C2Color::matrix_t, uint32_t,
     MATRIX_UNSPECIFIED,             ///< matrix coefficients are unspecified
-    MATRIX_BT709_5,                 ///< Rec.ITU-R BT.709-5 or equivalent
-    MATRIX_BT470_6M,                ///< KR=0.30, KB=0.11 or equivalent
-    MATRIX_BT601_6,                 ///< Rec.ITU-R BT.601-6 625 or equivalent
+    MATRIX_BT709,                   ///< Rec.ITU-R BT.709-5 or equivalent
+    MATRIX_FCC47_73_682,            ///< FCC Title 47 CFR 73.682 or equivalent (KR=0.30, KB=0.11)
+    MATRIX_BT601,                   ///< Rec.ITU-R BT.470, BT.601-6 625 or equivalent
     MATRIX_SMPTE240M,               ///< SMPTE 240M or equivalent
     MATRIX_BT2020,                  ///< Rec.ITU-R BT.2020 non-constant luminance
     MATRIX_BT2020CONSTANT,          ///< Rec.ITU-R BT.2020 constant luminance
@@ -1377,11 +1425,20 @@ C2ENUM(C2Color::matrix_t, uint32_t,
     MATRIX_OTHER = 0xff             ///< max value, reserved for undefined values
 )
 
+constexpr C2Color::matrix_t MATRIX_BT470_6M = MATRIX_FCC47_73_682; // deprecated
+constexpr C2Color::matrix_t MATRIX_BT709_5 = MATRIX_BT709; // deprecated
+constexpr C2Color::matrix_t MATRIX_BT601_6 = MATRIX_BT601; // deprecated
+
 struct C2ColorAspectsStruct {
     C2Color::range_t range;
     C2Color::primaries_t primaries;
     C2Color::transfer_t transfer;
     C2Color::matrix_t matrix;
+
+    C2ColorAspectsStruct() = default;
+    C2ColorAspectsStruct(C2Color::range_t range_, C2Color::primaries_t primaries_,
+                         C2Color::transfer_t transfer_, C2Color::matrix_t matrix_)
+        : range(range_), primaries(primaries_), transfer(transfer_), matrix(matrix_) {}
 
     DEFINE_AND_DESCRIBE_C2STRUCT(ColorAspects)
     C2FIELD(range, "range")
@@ -1799,6 +1856,18 @@ struct C2StoreIonUsageStruct {
 // store, private
 typedef C2GlobalParam<C2Info, C2StoreIonUsageStruct, kParamIndexStoreIonUsage>
         C2StoreIonUsageInfo;
+
+/**
+ * This structure describes the android dataspace for a raw video/image frame.
+ */
+typedef C2StreamParam<C2Info, C2Uint32Value, kParamIndexDataSpace> C2StreamDataSpaceInfo;
+constexpr char C2_PARAMKEY_DATA_SPACE[] = "raw.data-space";
+
+/**
+ * This structure describes the android dataspace for a raw video/image frame.
+ */
+typedef C2StreamParam<C2Info, C2Uint32Value, kParamIndexSurfaceScaling> C2StreamSurfaceScalingInfo;
+constexpr char C2_PARAMKEY_SURFACE_SCALING_MODE[] = "raw.surface-scaling";
 
 /* ======================================= INPUT SURFACE ======================================= */
 

@@ -21,19 +21,17 @@
 #include <codec2/hidl/1.0/Configurable.h>
 #include <hardware/google/media/c2/1.0/IComponentStore.h>
 #include <android/hardware/media/bufferpool/1.0/IClientManager.h>
-#include <hidl/HidlBinderSupport.h>
 #include <hidl/Status.h>
-#include <hwbinder/IBinder.h>
 
 #include <C2Component.h>
 #include <C2Param.h>
 #include <C2.h>
 
-#include <vector>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <map>
+#include <set>
+#include <vector>
 
 namespace hardware {
 namespace google {
@@ -45,12 +43,12 @@ namespace utils {
 using ::android::hardware::media::bufferpool::V1_0::IClientManager;
 
 using ::android::hardware::hidl_array;
+using ::android::hardware::hidl_handle;
 using ::android::hardware::hidl_memory;
 using ::android::hardware::hidl_string;
 using ::android::hardware::hidl_vec;
 using ::android::hardware::Return;
 using ::android::hardware::Void;
-using ::android::hardware::IBinder;
 using ::android::sp;
 using ::android::wp;
 
@@ -84,14 +82,22 @@ struct ComponentStore : public Configurable<IComponentStore> {
             const Buffer& src,
             const Buffer& dst) override;
 
+    // Debug dump
+    Return<void> debug(
+            const hidl_handle& handle,
+            const hidl_vec<hidl_string>& args) override;
+
 protected:
+    // does bookkeeping for an interface that has been loaded
+    void onInterfaceLoaded(const std::shared_ptr<C2ComponentInterface> &intf);
 
     c2_status_t mInit;
     std::shared_ptr<C2ComponentStore> mStore;
     std::shared_ptr<C2ParamReflector> mParamReflector;
 
-    std::map<C2Param::CoreIndex, std::shared_ptr<C2StructDescriptor>>
-            mStructDescriptors;
+    std::map<C2Param::CoreIndex, std::shared_ptr<C2StructDescriptor>> mStructDescriptors;
+    std::set<C2Param::CoreIndex> mUnsupportedStructDescriptors;
+    std::set<C2String> mLoadedInterfaces;
     mutable std::mutex mStructDescriptorsMutex;
 
     // Component lifetime management
@@ -102,7 +108,8 @@ protected:
     friend Component;
 
     // C2Component lookup
-    std::shared_ptr<C2Component> findC2Component(const wp<IBinder>& binder) const;
+    std::shared_ptr<C2Component> findC2Component(
+            const sp<IComponent>& component) const;
 
     friend struct InputSurface;
 };
