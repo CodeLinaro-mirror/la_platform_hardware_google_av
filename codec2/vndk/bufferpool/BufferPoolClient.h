@@ -63,6 +63,10 @@ public:
 private:
     bool isValid();
 
+    bool isLocal();
+
+    bool isActive(int64_t *lastTransactionUs, bool clearCache);
+
     ConnectionId getConnectionId();
 
     ResultStatus getAccessor(sp<IAccessor> *accessor);
