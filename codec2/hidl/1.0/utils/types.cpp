@@ -20,6 +20,8 @@
 
 #include <codec2/hidl/1.0/types.h>
 
+#include <media/stagefright/bqhelper/WGraphicBufferProducer.h>
+
 #include <C2AllocatorIon.h>
 #include <C2AllocatorGralloc.h>
 #include <C2BlockInternal.h>
@@ -31,8 +33,9 @@
 #include <C2Work.h>
 #include <util/C2ParamUtils.h>
 
-#include <unordered_map>
 #include <algorithm>
+#include <functional>
+#include <unordered_map>
 
 #include <media/stagefright/foundation/AUtils.h>
 
@@ -52,6 +55,7 @@ using ::android::hardware::media::bufferpool::V1_0::implementation::
         ClientManager;
 using ::android::hardware::media::bufferpool::V1_0::implementation::
         TransactionId;
+using ::android::TWGraphicBufferProducer;
 
 namespace /* unnamed */ {
 
@@ -255,12 +259,28 @@ Status objcpy(
         const C2Component::Traits &s) {
     d->name = s.name;
 
-    // TODO: Currently, we do not have any domain values defined in Codec2.0.
-    d->domain = IComponentStore::ComponentTraits::Domain::OTHER;
+    switch (s.domain) {
+    case C2Component::DOMAIN_VIDEO:
+        d->domain = IComponentStore::ComponentTraits::Domain::VIDEO;
+        break;
+    case C2Component::DOMAIN_AUDIO:
+        d->domain = IComponentStore::ComponentTraits::Domain::AUDIO;
+        break;
+    default:
+        d->domain = IComponentStore::ComponentTraits::Domain::OTHER;
+    }
     d->domainOther = static_cast<uint32_t>(s.domain);
 
-    // TODO: Currently, we do not have any kind values defined in Codec2.0.
-    d->kind = IComponentStore::ComponentTraits::Kind::OTHER;
+    switch (s.kind) {
+    case C2Component::KIND_DECODER:
+        d->kind = IComponentStore::ComponentTraits::Kind::DECODER;
+        break;
+    case C2Component::KIND_ENCODER:
+        d->kind = IComponentStore::ComponentTraits::Kind::ENCODER;
+        break;
+    default:
+        d->kind = IComponentStore::ComponentTraits::Kind::OTHER;
+    }
     d->kindOther = static_cast<uint32_t>(s.kind);
 
     d->rank = static_cast<uint32_t>(s.rank);
@@ -281,8 +301,29 @@ c2_status_t objcpy(
         std::unique_ptr<std::vector<std::string>>* aliasesBuffer,
         const IComponentStore::ComponentTraits& s) {
     d->name = s.name.c_str();
-    d->domain = static_cast<C2Component::domain_t>(s.domainOther);
-    d->kind = static_cast<C2Component::kind_t>(s.kindOther);
+
+    switch (s.domain) {
+    case IComponentStore::ComponentTraits::Domain::VIDEO:
+        d->domain = C2Component::DOMAIN_VIDEO;
+        break;
+    case IComponentStore::ComponentTraits::Domain::AUDIO:
+        d->domain = C2Component::DOMAIN_AUDIO;
+        break;
+    default:
+        d->domain = static_cast<C2Component::domain_t>(s.domainOther);
+    }
+
+    switch (s.kind) {
+    case IComponentStore::ComponentTraits::Kind::DECODER:
+        d->kind = C2Component::KIND_DECODER;
+        break;
+    case IComponentStore::ComponentTraits::Kind::ENCODER:
+        d->kind = C2Component::KIND_ENCODER;
+        break;
+    default:
+        d->kind = static_cast<C2Component::kind_t>(s.kindOther);
+    }
+
     d->rank = static_cast<C2Component::rank_t>(s.rank);
     d->mediaType = s.mediaType.c_str();
 
@@ -824,14 +865,13 @@ Status objcpy(FrameData* d, const C2FrameData& s,
 
 DefaultBufferPoolSender::DefaultBufferPoolSender(
         const sp<IClientManager>& receiverManager) :
-    mReceiverManager(receiverManager) {
+    mReceiverManager(receiverManager), mSourceConnectionId(0) {
 }
 
 void DefaultBufferPoolSender::setReceiver(const sp<IClientManager>& receiverManager) {
     std::lock_guard<std::mutex> lock(mMutex);
     if (mReceiverManager != receiverManager) {
         mReceiverManager = receiverManager;
-        mSourceAccessor = nullptr;
     }
 }
 
@@ -842,39 +882,30 @@ ResultStatus DefaultBufferPoolSender::send(
         ALOGE("No access to receiver's BufferPool.");
         return ResultStatus::NOT_FOUND;
     }
-
     ResultStatus rs;
     std::lock_guard<std::mutex> lock(mMutex);
-    sp<IAccessor> sourceAccessor = bpData->mAccessor.promote();
-    if (!mSourceAccessor || mSourceAccessor != sourceAccessor) {
-        // Initialize the bufferpool connection.
-        mSourceAccessor = sourceAccessor;
-        if (!mSourceAccessor) {
-            return ResultStatus::CRITICAL_ERROR;
-        }
-        Return<void> transResult = mReceiverManager->registerSender(
-                mSourceAccessor,
-                [&rs, this](
-                        ResultStatus status,
-                        int64_t connectionId) {
-                    rs = status;
-                    mReceiverConnectionId = connectionId;
-                });
-        if (!transResult.isOk()) {
-            ALOGE("registerSender -- failed transaction.");
-            mReceiverManager = nullptr;
-            return ResultStatus::CRITICAL_ERROR;
-        }
-        if ((rs != ResultStatus::OK) && (rs != ResultStatus::ALREADY_EXISTS)) {
-            ALOGW("registerSender -- returned error: %d.",
-                    static_cast<int>(rs));
-        }
-    }
     if (!mSenderManager) {
         mSenderManager = ClientManager::getInstance();
         if (!mSenderManager) {
             ALOGE("Failed to retrieve local BufferPool ClientManager.");
             return ResultStatus::CRITICAL_ERROR;
+        }
+    }
+    int64_t connectionId = bpData->mConnectionId;
+    if (mSourceConnectionId == 0 || mSourceConnectionId != connectionId) {
+        // Initialize the bufferpool connection.
+        mSourceConnectionId = connectionId;
+        if (mSourceConnectionId == 0) {
+            return ResultStatus::CRITICAL_ERROR;
+        }
+        int64_t receiverConnectionId;
+        rs = mSenderManager->registerSender(mReceiverManager, connectionId, &receiverConnectionId);
+        if ((rs != ResultStatus::OK) && (rs != ResultStatus::ALREADY_EXISTS)) {
+            ALOGW("registerSender -- returned error: %d.",
+                    static_cast<int>(rs));
+            return rs;
+        } else {
+            mReceiverConnectionId = receiverConnectionId;
         }
     }
 
@@ -899,7 +930,9 @@ ResultStatus DefaultBufferPoolSender::send(
 }
 
 // std::list<std::unique_ptr<C2Work>> -> WorkBundle
-Status objcpy(WorkBundle* d, const std::list<std::unique_ptr<C2Work>>& s,
+Status objcpy(
+        WorkBundle* d,
+        const std::list<std::unique_ptr<C2Work>>& s,
         BufferPoolSender* bufferPoolSender) {
     Status status = Status::OK;
 
@@ -1544,6 +1577,201 @@ c2_status_t toC2Status(ResultStatus rs) {
         ALOGW("Unrecognized BufferPool ResultStatus: %d", static_cast<int>(rs));
         return C2_CORRUPTED;
     }
+}
+
+namespace /* unnamed */ {
+
+// Create a GraphicBuffer object from a graphic block.
+sp<GraphicBuffer> createGraphicBuffer(const C2ConstGraphicBlock& block) {
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint64_t usage;
+    uint32_t stride;
+    uint64_t bqId;
+    int32_t bqSlot;
+    _UnwrapNativeCodec2GrallocMetadata(
+            block.handle(), &width, &height, &format, &usage,
+            &stride, &bqId, reinterpret_cast<uint32_t*>(&bqSlot));
+    native_handle_t *grallocHandle =
+            UnwrapNativeCodec2GrallocHandle(block.handle());
+    sp<GraphicBuffer> graphicBuffer =
+            new GraphicBuffer(grallocHandle,
+                              GraphicBuffer::CLONE_HANDLE,
+                              width, height, format,
+                              1, usage, stride);
+    native_handle_delete(grallocHandle);
+    return graphicBuffer;
+}
+
+template <typename BlockProcessor>
+void forEachBlock(C2FrameData& frameData,
+                  BlockProcessor process) {
+    for (const std::shared_ptr<C2Buffer>& buffer : frameData.buffers) {
+        if (buffer) {
+            for (const C2ConstGraphicBlock& block :
+                    buffer->data().graphicBlocks()) {
+                process(block);
+            }
+        }
+    }
+}
+
+template <typename BlockProcessor>
+void forEachBlock(const std::list<std::unique_ptr<C2Work>>& workList,
+                  BlockProcessor process,
+                  bool processInput, bool processOutput) {
+    for (const std::unique_ptr<C2Work>& work : workList) {
+        if (!work) {
+            continue;
+        }
+        if (processInput) {
+            forEachBlock(work->input, process);
+        }
+        if (processOutput) {
+            for (const std::unique_ptr<C2Worklet>& worklet : work->worklets) {
+                if (worklet) {
+                    forEachBlock(worklet->output,
+                                 process);
+                }
+            }
+        }
+    }
+}
+
+sp<HGraphicBufferProducer> getHgbp(const sp<IGraphicBufferProducer>& igbp) {
+    sp<HGraphicBufferProducer> hgbp = igbp->getHalInterface();
+    return hgbp ? hgbp :
+            new TWGraphicBufferProducer<HGraphicBufferProducer>(igbp);
+}
+
+} // unnamed namespace
+
+status_t attachToBufferQueue(const C2ConstGraphicBlock& block,
+                             const sp<IGraphicBufferProducer>& igbp,
+                             uint32_t generation,
+                             int32_t* bqSlot) {
+    if (!igbp) {
+        ALOGW("attachToBufferQueue -- null producer.");
+        return NO_INIT;
+    }
+
+    sp<GraphicBuffer> graphicBuffer = createGraphicBuffer(block);
+    graphicBuffer->setGenerationNumber(generation);
+
+    ALOGV("attachToBufferQueue -- attaching buffer: "
+            "block dimension %ux%u, "
+            "graphicBuffer dimension %ux%u, "
+            "format %#x, usage %#llx, stride %u, generation %u.",
+            static_cast<unsigned>(block.width()),
+            static_cast<unsigned>(block.height()),
+            static_cast<unsigned>(graphicBuffer->getWidth()),
+            static_cast<unsigned>(graphicBuffer->getHeight()),
+            static_cast<unsigned>(graphicBuffer->getPixelFormat()),
+            static_cast<unsigned long long>(graphicBuffer->getUsage()),
+            static_cast<unsigned>(graphicBuffer->getStride()),
+            static_cast<unsigned>(graphicBuffer->getGenerationNumber()));
+
+    status_t result = igbp->attachBuffer(bqSlot, graphicBuffer);
+    if (result != OK) {
+        ALOGW("attachToBufferQueue -- attachBuffer failed. Error code = %d",
+                static_cast<int>(result));
+        return false;
+    }
+    ALOGV("attachToBufferQueue -- attachBuffer returned slot %d",
+            static_cast<int>(*bqSlot));
+    return true;
+}
+
+bool getBufferQueueAssignment(const C2ConstGraphicBlock& block,
+                              uint64_t* bqId,
+                              int32_t* bqSlot) {
+    return _C2BlockFactory::GetBufferQueueData(
+            _C2BlockFactory::GetGraphicBlockPoolData(block),
+            bqId, bqSlot);
+}
+
+bool yieldBufferQueueBlock(const C2ConstGraphicBlock& block) {
+    std::shared_ptr<_C2BlockPoolData> data =
+            _C2BlockFactory::GetGraphicBlockPoolData(block);
+    if (data && _C2BlockFactory::GetBufferQueueData(data)) {
+        _C2BlockFactory::YieldBlockToBufferQueue(data);
+        return true;
+    }
+    return false;
+}
+
+void yieldBufferQueueBlocks(
+        const std::list<std::unique_ptr<C2Work>>& workList,
+        bool processInput, bool processOutput) {
+    forEachBlock(workList, yieldBufferQueueBlock, processInput, processOutput);
+}
+
+bool holdBufferQueueBlock(const C2ConstGraphicBlock& block,
+                            const sp<IGraphicBufferProducer>& igbp,
+                            uint64_t bqId,
+                            uint32_t generation) {
+    std::shared_ptr<_C2BlockPoolData> data =
+            _C2BlockFactory::GetGraphicBlockPoolData(block);
+    if (!data) {
+        return false;
+    }
+
+    uint64_t oldId;
+    int32_t oldSlot;
+    // If the block is not bufferqueue-based, do nothing.
+    if (!_C2BlockFactory::GetBufferQueueData(data, &oldId, &oldSlot) ||
+            (oldId == 0)) {
+        return false;
+    }
+
+    // If the block's bqId is the same as the desired bqId, just hold.
+    if (oldId == bqId) {
+        ALOGV("holdBufferQueueBlock -- import without attaching: "
+                "bqId %llu, bqSlot %d, generation %u.",
+                static_cast<long long unsigned>(oldId),
+                static_cast<int>(oldSlot),
+                static_cast<unsigned>(generation));
+        _C2BlockFactory::HoldBlockFromBufferQueue(data, getHgbp(igbp));
+        return true;
+    }
+
+    // Otherwise, attach to the given igbp, which must not be null.
+    if (!igbp) {
+        return false;
+    }
+
+    int32_t bqSlot;
+    status_t result = attachToBufferQueue(block, igbp, generation, &bqSlot);
+
+    if (result != OK) {
+        ALOGE("holdBufferQueueBlock -- fail to attach: "
+                "target bqId %llu, generation %u.",
+                static_cast<long long unsigned>(bqId),
+                static_cast<unsigned>(generation));
+
+        return false;
+    }
+
+    ALOGV("holdBufferQueueBlock -- attached: "
+            "bqId %llu, bqSlot %d, generation %u.",
+            static_cast<long long unsigned>(bqId),
+            static_cast<int>(bqSlot),
+            static_cast<unsigned>(generation));
+    _C2BlockFactory::AssignBlockToBufferQueue(
+            data, getHgbp(igbp), bqId, bqSlot, true);
+    return true;
+}
+
+void holdBufferQueueBlocks(const std::list<std::unique_ptr<C2Work>>& workList,
+                           const sp<IGraphicBufferProducer>& igbp,
+                           uint64_t bqId,
+                           uint32_t generation,
+                           bool forInput) {
+    forEachBlock(workList,
+                 std::bind(holdBufferQueueBlock,
+                           std::placeholders::_1, igbp, bqId, generation),
+                 forInput, !forInput);
 }
 
 }  // namespace utils

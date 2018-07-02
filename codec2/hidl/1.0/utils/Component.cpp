@@ -162,9 +162,9 @@ struct Component::Listener : public C2Component::Listener {
             Return<void> transStatus = listener->onWorkDone(workBundle);
             if (!transStatus.isOk()) {
                 ALOGE("onWorkDone -- transaction failed.");
+                return;
             }
-
-            // Finish buffer transfers: nothing else to do
+            yieldBufferQueueBlocks(c2workItems, true);
         }
     }
 
@@ -220,11 +220,11 @@ Return<void> Component::flush(flush_cb _hidl_cb) {
 
     Status res = static_cast<Status>(c2res);
     if (c2res == C2_OK) {
-        // TODO: Connect with bufferpool API for buffer transfers
         ALOGV("flush -- converting output");
         res = objcpy(&flushedWorkBundle, c2flushedWorks, &mBufferPoolSender);
     }
     _hidl_cb(res, flushedWorkBundle);
+    yieldBufferQueueBlocks(c2flushedWorks, true);
     return Void();
 }
 
@@ -243,7 +243,16 @@ Return<Status> Component::setOutputSurface(
     if (pool && pool->getAllocatorId() == C2PlatformAllocatorStore::BUFFERQUEUE) {
         std::shared_ptr<C2BufferQueueBlockPool> bqPool =
                 std::static_pointer_cast<C2BufferQueueBlockPool>(pool);
+        C2BufferQueueBlockPool::OnRenderCallback cb =
+            [this](uint64_t producer, int32_t slot, int64_t nsecs) {
+                // TODO: batch this
+                hidl_vec<IComponentListener::RenderedFrame> rendered;
+                rendered.resize(1);
+                rendered[0] = { producer, slot, nsecs };
+                mListener->onFramesRendered(rendered);
+        };
         if (bqPool) {
+            bqPool->setRenderCallback(cb);
             bqPool->configureProducer(surface);
         }
     }
@@ -264,6 +273,57 @@ Return<Status> Component::disconnectFromInputSurface() {
     // TODO implement
     return Status::OK;
 }
+
+namespace /* unnamed */ {
+
+struct BlockPoolIntf : public ConfigurableC2Intf {
+    BlockPoolIntf(const std::shared_ptr<C2BlockPool>& pool) :
+        ConfigurableC2Intf("C2BlockPool:" + std::to_string(pool->getLocalId())),
+        mPool(pool) {
+    }
+
+    virtual c2_status_t config(
+            const std::vector<C2Param*>& params,
+            c2_blocking_t mayBlock,
+            std::vector<std::unique_ptr<C2SettingResult>>* const failures
+            ) override {
+        (void)params;
+        (void)mayBlock;
+        (void)failures;
+        return C2_OK;
+    }
+
+    virtual c2_status_t query(
+            const std::vector<C2Param::Index>& indices,
+            c2_blocking_t mayBlock,
+            std::vector<std::unique_ptr<C2Param>>* const params
+            ) const override {
+        (void)indices;
+        (void)mayBlock;
+        (void)params;
+        return C2_OK;
+    }
+
+    virtual c2_status_t querySupportedParams(
+            std::vector<std::shared_ptr<C2ParamDescriptor>>* const params
+            ) const override {
+        (void)params;
+        return C2_OK;
+    }
+
+    virtual c2_status_t querySupportedValues(
+            std::vector<C2FieldSupportedValuesQuery>& fields,
+            c2_blocking_t mayBlock) const override {
+        (void)fields;
+        (void)mayBlock;
+        return C2_OK;
+    }
+
+protected:
+    std::shared_ptr<C2BlockPool> mPool;
+};
+
+} // unnamed namespace
 
 Return<void> Component::createBlockPool(
         uint32_t allocatorId,
@@ -286,7 +346,8 @@ Return<void> Component::createBlockPool(
 
     _hidl_cb(static_cast<Status>(status),
             blockPool ? blockPool->getLocalId() : 0,
-            nullptr /* configurable */);
+            new CachedConfigurable(
+            std::make_unique<BlockPoolIntf>(blockPool)));
     return Void();
 }
 

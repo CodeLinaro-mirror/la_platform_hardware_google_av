@@ -961,10 +961,9 @@ public:
         return C2_OMITTED;
     }
 
+    virtual ~C2BlockPool() = default;
 protected:
     C2BlockPool() = default;
-
-    virtual ~C2BlockPool() = default;
 };
 
 /// @}
@@ -2126,6 +2125,17 @@ public:
      * \return true iff there is a metadata with the parameter type attached to this buffer.
      */
     bool hasInfo(C2Param::Type index) const;
+
+    /**
+     * Checks if there is a certain type of metadata attached to this buffer, and returns a
+     * shared pointer to it if there is. Returns an empty shared pointer object (nullptr) if there
+     * is not.
+     *
+     * \param index the parameter type of the metadata
+     *
+     * \return shared pointer to the metadata.
+     */
+    std::shared_ptr<const C2Info> getInfo(C2Param::Type index) const;
 
     /**
      * Removes a metadata from the buffer.
