@@ -78,7 +78,7 @@ private:
      *
      * \param structs List of structure descriptors to add support for
      */
-    C2_HIDE void addStructDescriptors(
+    void addStructDescriptors(
             std::vector<C2StructDescriptor> &structs, _Tuple<> *);
 
     /**
@@ -397,9 +397,16 @@ public:
             // this must fall either within sizeof(T) + FLEX_SIZE or param->size()
             // size_t size = sizeof(field);
             // mParam may be null
-            size_t baseOffs = GetBaseOffset(
-                    _mReflector, T::CORE_INDEX, offs - sizeof(C2Param)) + sizeof(C2Param);
             size_t baseSize = sizeof(typename std::remove_extent<S>::type);
+            size_t baseOffs = GetBaseOffset(
+                    _mReflector, T::CORE_INDEX, offs - sizeof(C2Param));
+            if (~baseOffs == 0) {
+                // C2_LOG(FATAL) << "unknown field at offset " << offs << " size " << sizeof(S)
+                //       << " base-size " << baseSize;
+                // __builtin_trap();
+            } else {
+                baseOffs += sizeof(C2Param);
+            }
 
             std::shared_ptr<FieldHelper> helper = _mHelper->findField(baseOffs, baseSize);
             return FieldType<S>(helper, _mTypedParam->index());
@@ -616,7 +623,7 @@ public:
         inline ParamBuilder &calculatedAs(
                 C2R (*fn)(bool, C2P<T> &, const C2P<Deps> &...), std::shared_ptr<Deps>& ... deps) {
             attrib() |= attrib_t::IS_READ_ONLY;
-            return withSetter(fn, std::forward(deps...));
+            return withSetter(fn, std::forward<decltype(deps)>(deps)...);
         }
 
         inline std::shared_ptr<ParamHelper> build() {
