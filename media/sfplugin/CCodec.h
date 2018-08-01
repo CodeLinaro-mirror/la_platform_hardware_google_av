@@ -95,6 +95,9 @@ private:
 
     void setDeadline(const TimePoint &deadline, const char *name);
 
+    void onWorkQueued(bool eos);
+    void subQueuedWorkCount(uint32_t count);
+
     enum {
         kWhatAllocate,
         kWhatConfigure,
@@ -107,6 +110,7 @@ private:
         kWhatSetParameters,
 
         kWhatWorkDone,
+        kWhatWatch,
     };
 
     enum {
@@ -158,6 +162,9 @@ private:
     struct ClientListener;
 
     Mutexed<NamedTimePoint> mDeadline;
+    std::atomic_int32_t mQueuedWorkCount;
+    Mutexed<NamedTimePoint> mQueueDeadline;
+    Mutexed<NamedTimePoint> mEosDeadline;
     typedef CCodecConfig Config;
     Mutexed<Config> mConfig;
     Mutexed<std::list<std::unique_ptr<C2Work>>> mWorkDoneQueue;
