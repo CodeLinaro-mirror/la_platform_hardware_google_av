@@ -1330,59 +1330,124 @@ void CCodecBufferChannel::QueueSync::stop() {
 // CCodecBufferChannel::PipelineCapacity
 
 CCodecBufferChannel::PipelineCapacity::PipelineCapacity()
-      : component(0), output(0), mName("<UNKNOWN COMPONENT>") {
+      : input(0), lentInput(0), component(0), output(0),
+        mName("<UNKNOWN COMPONENT>") {
 }
 
 void CCodecBufferChannel::PipelineCapacity::initialize(
+        int newInput,
         int newComponent,
         int newOutput,
         const char* newName,
         const char* callerTag) {
+    input.store(newInput, std::memory_order_relaxed);
+    lentInput.store(0, std::memory_order_relaxed);
     component.store(newComponent, std::memory_order_relaxed);
     output.store(newOutput, std::memory_order_relaxed);
     mName = newName;
     ALOGV("[%s] %s -- PipelineCapacity::initialize(): "
           "pipeline availability initialized ==> "
-          "component = %d, output = %d",
+          "input = %d (-%d), component = %d, output = %d",
             mName, callerTag ? callerTag : "*",
-            newComponent, newOutput);
+            newInput, 0, newComponent, newOutput);
 }
 
 bool CCodecBufferChannel::PipelineCapacity::allocate(const char* callerTag) {
+    int prevInput = input.fetch_sub(1, std::memory_order_relaxed);
     int prevComponent = component.fetch_sub(1, std::memory_order_relaxed);
     int prevOutput = output.fetch_sub(1, std::memory_order_relaxed);
-    if (prevComponent > 0 && prevOutput > 0) {
+    if (prevInput > 0 && prevComponent > 0 && prevOutput > 0) {
         ALOGV("[%s] %s -- PipelineCapacity::allocate() returns true: "
-              "pipeline availability -1 all ==> component = %d, output = %d",
+              "pipeline availability -1 all ==> "
+              "input = %d (-%d), component = %d, output = %d",
                 mName, callerTag ? callerTag : "*",
-                prevComponent - 1, prevOutput - 1);
+                prevInput - 1,
+                lentInput.load(std::memory_order_relaxed),
+                prevComponent - 1,
+                prevOutput - 1);
         return true;
     }
+    input.fetch_add(1, std::memory_order_relaxed);
     component.fetch_add(1, std::memory_order_relaxed);
     output.fetch_add(1, std::memory_order_relaxed);
     ALOGV("[%s] %s -- PipelineCapacity::allocate() returns false: "
-          "pipeline availability unchanged ==> component = %d, output = %d",
+          "pipeline availability unchanged ==> "
+          "input = %d (-%d), component = %d, output = %d",
             mName, callerTag ? callerTag : "*",
-            prevComponent, prevOutput);
+            prevInput,
+            lentInput.load(std::memory_order_relaxed),
+            prevComponent,
+            prevOutput);
     return false;
 }
 
 void CCodecBufferChannel::PipelineCapacity::free(const char* callerTag) {
+    int prevInput = input.fetch_add(1, std::memory_order_relaxed);
     int prevComponent = component.fetch_add(1, std::memory_order_relaxed);
     int prevOutput = output.fetch_add(1, std::memory_order_relaxed);
     ALOGV("[%s] %s -- PipelineCapacity::free(): "
-          "pipeline availability +1 all ==> component = %d, output = %d",
+          "pipeline availability +1 all ==> "
+          "input = %d (-%d), component = %d, output = %d",
             mName, callerTag ? callerTag : "*",
-            prevComponent + 1, prevOutput + 1);
+            prevInput + 1,
+            lentInput.load(std::memory_order_relaxed),
+            prevComponent + 1,
+            prevOutput + 1);
+}
+
+int CCodecBufferChannel::PipelineCapacity::lendInputSlot(
+        const char* callerTag) {
+    int prevInput = input.fetch_add(1, std::memory_order_relaxed);
+    int prevLentInput = lentInput.fetch_add(1, std::memory_order_relaxed);
+    ALOGV("[%s] %s -- PipelineCapacity::lendInputSlot(): "
+          "pipeline availability +1 (-1) input ==> "
+          "input = %d (-%d), component = %d, output = %d",
+            mName, callerTag ? callerTag : "*",
+            prevInput + 1,
+            prevLentInput + 1,
+            component.load(std::memory_order_relaxed),
+            output.load(std::memory_order_relaxed));
+    return prevInput + 1;
+}
+
+int CCodecBufferChannel::PipelineCapacity::freeInputSlot(
+        const char* callerTag) {
+    int prevLentInput = lentInput.fetch_sub(1, std::memory_order_relaxed);
+    if (prevLentInput > 0) {
+        ALOGV("[%s] %s -- PipelineCapacity::freeInputSlot(): "
+              "pipeline availability +0 (+1) input ==> "
+              "input = %d (-%d), component = %d, output = %d",
+                mName, callerTag ? callerTag : "*",
+                input.load(std::memory_order_relaxed),
+                prevLentInput - 1,
+                component.load(std::memory_order_relaxed),
+                output.load(std::memory_order_relaxed));
+        return input.load(std::memory_order_relaxed);
+    }
+    lentInput.fetch_add(1, std::memory_order_relaxed);
+    int prevInput = input.fetch_add(1, std::memory_order_relaxed);
+    ALOGV("[%s] %s -- PipelineCapacity::freeInputSlot(): "
+          "pipeline availability +1 (+0) input ==> "
+          "input = %d (-%d), component = %d, output = %d",
+            mName, callerTag ? callerTag : "*",
+            prevInput + 1,
+            prevLentInput,
+            component.load(std::memory_order_relaxed),
+            output.load(std::memory_order_relaxed));
+    return prevInput + 1;
 }
 
 int CCodecBufferChannel::PipelineCapacity::freeComponentSlot(
         const char* callerTag) {
     int prevComponent = component.fetch_add(1, std::memory_order_relaxed);
     ALOGV("[%s] %s -- PipelineCapacity::freeComponentSlot(): "
-          "pipeline availability +1 component ==> component = %d, output = %d",
+          "pipeline availability +1 component ==> "
+          "input = %d (-%d), component = %d, output = %d",
             mName, callerTag ? callerTag : "*",
-            prevComponent + 1, output.load(std::memory_order_relaxed));
+            input.load(std::memory_order_relaxed),
+            lentInput.load(std::memory_order_relaxed),
+            prevComponent + 1,
+            output.load(std::memory_order_relaxed));
     return prevComponent + 1;
 }
 
@@ -1390,9 +1455,13 @@ int CCodecBufferChannel::PipelineCapacity::freeOutputSlot(
         const char* callerTag) {
     int prevOutput = output.fetch_add(1, std::memory_order_relaxed);
     ALOGV("[%s] %s -- PipelineCapacity::freeOutputSlot(): "
-          "pipeline availability +1 output ==> component = %d, output = %d",
+          "pipeline availability +1 output ==> "
+          "input = %d (-%d), component = %d, output = %d",
             mName, callerTag ? callerTag : "*",
-            component.load(std::memory_order_relaxed), prevOutput + 1);
+            input.load(std::memory_order_relaxed),
+            lentInput.load(std::memory_order_relaxed),
+            component.load(std::memory_order_relaxed),
+            prevOutput + 1);
     return prevOutput + 1;
 }
 
@@ -1868,11 +1937,13 @@ status_t CCodecBufferChannel::start(
             C2_DONT_BLOCK,
             nullptr);
     mAvailablePipelineCapacity.initialize(
+            inputDelay,
             inputDelay + pipelineDelay,
             inputDelay + pipelineDelay + outputDelay,
             mName);
 #else
     mAvailablePipelineCapacity.initialize(
+            kMinInputBufferArraySize,
             kMaxPipelineCapacity,
             kMinOutputBufferArraySize,
             mName);
@@ -2117,7 +2188,8 @@ status_t CCodecBufferChannel::start(
                     outputGeneration);
         }
 
-        if (oStreamFormat.value == C2BufferData::LINEAR) {
+        if (oStreamFormat.value == C2BufferData::LINEAR
+                && mComponentName.find("c2.qti.") == std::string::npos) {
             // WORKAROUND: if we're using early CSD workaround we convert to
             //             array mode, to appease apps assuming the output
             //             buffers to be of the same size.
@@ -2159,6 +2231,7 @@ status_t CCodecBufferChannel::requestInitialInputBuffers() {
     if (err != C2_OK) {
         return UNKNOWN_ERROR;
     }
+    std::vector<sp<MediaCodecBuffer>> toBeQueued;
     // TODO: use proper buffer depth instead of this random value
     for (size_t i = 0; i < kMinInputBufferArraySize; ++i) {
         size_t index;
@@ -2188,41 +2261,35 @@ status_t CCodecBufferChannel::requestInitialInputBuffers() {
                     buffer->meta()->clear();
                     buffer->meta()->setInt64("timeUs", 0);
                     buffer->meta()->setInt32("csd", 1);
-                    configs.unlock();
-                    if (queueInputBufferInternal(buffer) == OK) {
-                        ALOGV("[%s] queued flushed codec config", mName);
-                        configs.lock();
-
-                        configs->pop_front();
-                        post = false;
-                    } else {
-                        ALOGD("[%s] failed to queue flushed codec config", mName);
-                        configs.lock();
-
-                        buffer->setRange(0, buffer->capacity());
-                    }
+                    post = false;
                 } else {
                     ALOGD("[%s] buffer capacity too small for the config (%zu < %zu)",
                             mName, buffer->capacity(), config->size());
                 }
-            } else if (oStreamFormat.value == C2BufferData::LINEAR && i == 0) {
+            } else if (oStreamFormat.value == C2BufferData::LINEAR && i == 0
+                    && mComponentName.find("c2.qti.") == std::string::npos) {
                 // WORKAROUND: Some apps expect CSD available without queueing
                 //             any input. Queue an empty buffer to get the CSD.
                 buffer->setRange(0, 0);
                 buffer->meta()->clear();
                 buffer->meta()->setInt64("timeUs", 0);
-                (void)queueInputBufferInternal(buffer);
+                post = false;
             }
-            if (post) {
-                if (mAvailablePipelineCapacity.allocate(
-                        "requestInitialInputBuffers")) {
+            if (mAvailablePipelineCapacity.allocate("requestInitialInputBuffers")) {
+                if (post) {
                     mCallback->onInputBufferAvailable(index, buffer);
                 } else {
-                    ALOGD("[%s] pipeline is full while "
-                          "requesting %zu-th input buffer",
-                            mName, i);
+                    toBeQueued.emplace_back(buffer);
                 }
+            } else {
+                ALOGD("[%s] pipeline is full while requesting %zu-th input buffer",
+                        mName, i);
             }
+        }
+    }
+    for (const sp<MediaCodecBuffer> &buffer : toBeQueued) {
+        if (queueInputBufferInternal(buffer) != OK) {
+            mAvailablePipelineCapacity.free("requestInitialInputBuffers");
         }
     }
     return OK;
@@ -2273,6 +2340,7 @@ void CCodecBufferChannel::flush(const std::list<std::unique_ptr<C2Work>> &flushe
 void CCodecBufferChannel::onWorkDone(
         std::unique_ptr<C2Work> work, const sp<AMessage> &outputFormat,
         const C2StreamInitDataInfo::output *initData) {
+    mAvailablePipelineCapacity.freeInputSlot("onWorkDone");
     mAvailablePipelineCapacity.freeComponentSlot("onWorkDone");
     if (handleWork(std::move(work), outputFormat, initData)) {
         mAvailablePipelineCapacity.freeOutputSlot("onWorkDone");
@@ -2288,6 +2356,7 @@ void CCodecBufferChannel::onInputBufferDone(
         newInputSlotAvailable = (*buffers)->expireComponentBuffer(buffer);
     }
     if (newInputSlotAvailable) {
+        mAvailablePipelineCapacity.lendInputSlot("onInputBufferDone");
         feedInputBufferIfAvailable();
     }
 }
@@ -2441,33 +2510,21 @@ bool CCodecBufferChannel::handleWork(
 }
 
 status_t CCodecBufferChannel::setSurface(const sp<Surface> &newSurface) {
-    if (newSurface != nullptr) {
+    static std::atomic_uint32_t surfaceGeneration{0};
+    uint32_t generation = (getpid() << 10) |
+            ((surfaceGeneration.fetch_add(1, std::memory_order_relaxed) + 1)
+                & ((1 << 10) - 1));
+
+    sp<IGraphicBufferProducer> producer;
+    if (newSurface) {
         newSurface->setScalingMode(NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW);
         newSurface->setMaxDequeuedBufferCount(kMinOutputBufferArraySize);
+        producer = newSurface->getIGraphicBufferProducer();
+        producer->setGenerationNumber(generation);
+    } else {
+        ALOGE("[%s] setting output surface to null", mName);
+        return INVALID_OPERATION;
     }
-
-//    if (newSurface == nullptr) {
-//        if (*surface != nullptr) {
-//            ALOGI("[%s] cannot unset a surface", mName);
-//            return INVALID_OPERATION;
-//        }
-//        return OK;
-//    }
-//
-//    if (*surface == nullptr) {
-//        ALOGI("[%s] component was not configured with a surface", mName);
-//        return INVALID_OPERATION;
-//    }
-
-    uint32_t generation;
-
-    ANativeWindowBuffer *buf;
-    ANativeWindow *window = newSurface.get();
-    int fenceFd;
-    window->dequeueBuffer(window, &buf, &fenceFd);
-    sp<GraphicBuffer> gbuf = GraphicBuffer::from(buf);
-    generation = gbuf->getGenerationNumber();
-    window->cancelBuffer(window, buf, fenceFd);
 
     std::shared_ptr<Codec2Client::Configurable> outputPoolIntf;
     C2BlockPool::local_id_t outputPoolId;
@@ -2480,7 +2537,7 @@ status_t CCodecBufferChannel::setSurface(const sp<Surface> &newSurface) {
     if (outputPoolIntf) {
         if (mComponent->setOutputSurface(
                 outputPoolId,
-                newSurface->getIGraphicBufferProducer(),
+                producer,
                 generation) != C2_OK) {
             ALOGI("[%s] setSurface: component setOutputSurface failed", mName);
             return INVALID_OPERATION;
@@ -2490,7 +2547,7 @@ status_t CCodecBufferChannel::setSurface(const sp<Surface> &newSurface) {
     {
         Mutexed<OutputSurface>::Locked output(mOutputSurface);
         output->surface = newSurface;
-        output->generation = generation = gbuf->getGenerationNumber();
+        output->generation = generation;
     }
 
     return OK;
