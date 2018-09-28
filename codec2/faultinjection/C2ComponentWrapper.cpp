@@ -17,34 +17,67 @@
 #define LOG_NDEBUG 0
 #define LOG_TAG "C2ComponentWrapper"
 
-#include <inttypes.h>
+#include <chrono>
+#include <functional>
+#include <thread>
 
+#include <C2ComponentWrapper.h>
 #include <C2Config.h>
 #include <C2PlatformSupport.h>
 
-#include <C2ComponentWrapper.h>
-
-#include <functional>
-
 namespace android {
+
+namespace {
+
+using namespace std::chrono_literals;
+
+c2_status_t WrapSimpleMethod(
+        std::function<c2_status_t(void)> op, const SimpleMethodState &state) {
+    c2_status_t result = C2_OK;
+    switch (state.getMode()) {
+        case SimpleMethodState::EXECUTE:
+            result = op();
+            break;
+        case SimpleMethodState::NO_OP:
+            break;
+        case SimpleMethodState::HANG:
+            while (true) {
+                std::this_thread::sleep_for(1s);
+            }
+            break;
+    }
+    (void)state.overrideResult(&result);
+    return result;
+}
+
+}  // namespace
+
+C2ComponentWrapper::Injecter::Injecter(C2ComponentWrapper *thiz) : mThiz(thiz) {}
+
+SimpleMethodState::Injecter C2ComponentWrapper::Injecter::start() {
+    return SimpleMethodState::Injecter(&mThiz->mStartState);
+}
 
 C2ComponentWrapper::Listener::Listener(
         const std::shared_ptr<C2Component::Listener> &listener) : mListener(listener) {}
+
 void C2ComponentWrapper::Listener::onWorkDone_nb(std::weak_ptr<C2Component> component,
         std::list<std::unique_ptr<C2Work>> workItems) {
     mListener->onWorkDone_nb(component, std::move(workItems));
 }
+
 void C2ComponentWrapper::Listener::onTripped_nb(std::weak_ptr<C2Component> component,
         std::vector<std::shared_ptr<C2SettingResult>> settingResult) {
     mListener->onTripped_nb(component,settingResult);
 }
+
 void C2ComponentWrapper::Listener::onError_nb(
         std::weak_ptr<C2Component> component, uint32_t errorCode) {
-      mListener->onError_nb(component, errorCode);
+    mListener->onError_nb(component, errorCode);
 }
 
 C2ComponentWrapper::C2ComponentWrapper(
-        const std::shared_ptr<C2Component> &comp) : mComp(comp){}
+        const std::shared_ptr<C2Component> &comp) : mComp(comp) {}
 
 c2_status_t C2ComponentWrapper::setListener_vb(
         const std::shared_ptr<C2Component::Listener> &listener, c2_blocking_t mayBlock) {
@@ -70,7 +103,7 @@ c2_status_t C2ComponentWrapper::drain_nb(C2Component::drain_mode_t mode) {
 }
 
 c2_status_t C2ComponentWrapper::start() {
-    return mComp->start();
+    return WrapSimpleMethod([this] { return mComp->start(); }, mStartState);
 }
 
 c2_status_t C2ComponentWrapper::stop() {
@@ -89,4 +122,8 @@ std::shared_ptr<C2ComponentInterface> C2ComponentWrapper::intf(){
     return mComp->intf();
 }
 
-} // namespace android
+C2ComponentWrapper::Injecter C2ComponentWrapper::inject() {
+    return Injecter(this);
+}
+
+}  // namespace android

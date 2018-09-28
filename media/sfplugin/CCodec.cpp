@@ -36,6 +36,7 @@
 #include <gui/Surface.h>
 #include <gui/bufferqueue/1.0/H2BGraphicBufferProducer.h>
 #include <media/omx/1.0/WGraphicBufferSource.h>
+#include <media/openmax/OMX_IndexExt.h>
 #include <media/stagefright/BufferProducerWrapper.h>
 #include <media/stagefright/MediaCodecConstants.h>
 #include <media/stagefright/PersistentSurface.h>
@@ -153,6 +154,11 @@ public:
         }
     }
 
+    status_t start() override {
+        // InputSurface does not distinguish started state
+        return OK;
+    }
+
     status_t signalEndOfInputStream() override {
         C2InputSurfaceEosTuning eos(true);
         std::vector<std::unique_ptr<C2SettingResult>> failures;
@@ -193,16 +199,6 @@ public:
 
         // TODO: configure according to intf().
         // TODO: initial color aspects (dataspace)
-
-        sp<IOMXBufferSource> source = mNode->getSource();
-        if (source == nullptr) {
-            return NO_INIT;
-        }
-        constexpr size_t kNumSlots = 16;
-        for (size_t i = 0; i < kNumSlots; ++i) {
-            source->onInputBufferAdded(i);
-        }
-        source->onOmxExecuting();
         return OK;
     }
 
@@ -235,6 +231,20 @@ public:
         return err;
     }
 
+    status_t start() override {
+        sp<IOMXBufferSource> source = mNode->getSource();
+        if (source == nullptr) {
+            return NO_INIT;
+        }
+        constexpr size_t kNumSlots = 16;
+        for (size_t i = 0; i < kNumSlots; ++i) {
+            source->onInputBufferAdded(i);
+        }
+
+        source->onOmxExecuting();
+        return OK;
+    }
+
     status_t signalEndOfInputStream() override {
         return GetStatus(mSource->signalEndOfInputStream());
     }
@@ -258,7 +268,19 @@ public:
             mConfig.mMinFps = config.mMinFps;
         }
 
-        // TODO: pts gap
+        // pts gap
+        if (config.mMinAdjustedFps > 0 || config.mFixedAdjustedFps > 0) {
+            if (mNode != nullptr) {
+                OMX_PARAM_U32TYPE ptrGapParam = {};
+                ptrGapParam.nSize = sizeof(OMX_PARAM_U32TYPE);
+                ptrGapParam.nU32 = (config.mMinAdjustedFps > 0)
+                        ? c2_min(INT32_MAX + 0., 1e6 / config.mMinAdjustedFps + 0.5)
+                        : c2_max(0. - INT32_MAX, -1e6 / config.mFixedAdjustedFps - 0.5);
+                (void)mNode->setParameter(
+                        (OMX_INDEXTYPE)OMX_IndexParamMaxFrameDurationForBitrateControl,
+                        &ptrGapParam, sizeof(ptrGapParam));
+            }
+        }
 
         // max fps
         // TRICKY: we do not unset max fps to 0 unless using fixed fps
@@ -479,6 +501,14 @@ struct CCodec::ClientListener : public Codec2Client::Listener {
         (void)renderedFrames;
     }
 
+    virtual void onInputBufferDone(
+            const std::shared_ptr<C2Buffer>& buffer) override {
+        sp<CCodec> codec(mCodec.promote());
+        if (codec) {
+            codec->onInputBufferDone(buffer);
+        }
+    }
+
 private:
     wp<CCodec> mCodec;
 };
@@ -610,7 +640,7 @@ void CCodec::allocate(const sp<MediaCodecInfo> &codecInfo) {
     }
     config->queryConfiguration(comp);
 
-    mCallback->onComponentAllocated(comp->getName().c_str());
+    mCallback->onComponentAllocated(componentName.c_str());
 }
 
 void CCodec::initiateConfigureComponent(const sp<AMessage> &format) {
@@ -962,14 +992,14 @@ status_t CCodec::setupInputSurface(const std::shared_ptr<InputSurfaceWrapper> &s
     Mutexed<Config>::Locked config(mConfig);
     config->mInputSurface = surface;
     config->mUsingSurface = true;
+
     if (config->mISConfig) {
         surface->configure(*config->mISConfig);
     } else {
         ALOGD("ISConfig: no configuration");
     }
 
-    // TODO: configure |surface| with other settings.
-    return OK;
+    return surface->start();
 }
 
 void CCodec::initiateSetInputSurface(const sp<PersistentSurface> &surface) {
@@ -1386,13 +1416,17 @@ void CCodec::onWorkDone(std::list<std::unique_ptr<C2Work>> &workItems) {
     (new AMessage(kWhatWorkDone, this))->post();
 }
 
+void CCodec::onInputBufferDone(const std::shared_ptr<C2Buffer>& buffer) {
+    mChannel->onInputBufferDone(buffer);
+}
+
 void CCodec::onMessageReceived(const sp<AMessage> &msg) {
     TimePoint now = std::chrono::steady_clock::now();
     CCodecWatchdog::getInstance()->watch(this);
     switch (msg->what()) {
         case kWhatAllocate: {
             // C2ComponentStore::createComponent() should return within 100ms.
-            setDeadline(now + 150ms, "allocate");
+            setDeadline(now, 150ms, "allocate");
             sp<RefBase> obj;
             CHECK(msg->findObject("codecInfo", &obj));
             allocate((MediaCodecInfo *)obj.get());
@@ -1400,7 +1434,7 @@ void CCodec::onMessageReceived(const sp<AMessage> &msg) {
         }
         case kWhatConfigure: {
             // C2Component::commit_sm() should return within 5ms.
-            setDeadline(now + 50ms, "configure");
+            setDeadline(now, 250ms, "configure");
             sp<AMessage> format;
             CHECK(msg->findMessage("format", &format));
             configure(format);
@@ -1408,14 +1442,14 @@ void CCodec::onMessageReceived(const sp<AMessage> &msg) {
         }
         case kWhatStart: {
             // C2Component::start() should return within 500ms.
-            setDeadline(now + 550ms, "start");
+            setDeadline(now, 550ms, "start");
             mQueuedWorkCount = 0;
             start();
             break;
         }
         case kWhatStop: {
             // C2Component::stop() should return within 500ms.
-            setDeadline(now + 550ms, "stop");
+            setDeadline(now, 550ms, "stop");
             stop();
 
             mQueuedWorkCount = 0;
@@ -1425,19 +1459,19 @@ void CCodec::onMessageReceived(const sp<AMessage> &msg) {
         }
         case kWhatFlush: {
             // C2Component::flush_sm() should return within 5ms.
-            setDeadline(now + 50ms, "flush");
+            setDeadline(now, 50ms, "flush");
             flush();
             break;
         }
         case kWhatCreateInputSurface: {
             // Surface operations may be briefly blocking.
-            setDeadline(now + 100ms, "createInputSurface");
+            setDeadline(now, 100ms, "createInputSurface");
             createInputSurface();
             break;
         }
         case kWhatSetInputSurface: {
             // Surface operations may be briefly blocking.
-            setDeadline(now + 100ms, "setInputSurface");
+            setDeadline(now, 100ms, "setInputSurface");
             sp<RefBase> obj;
             CHECK(msg->findObject("surface", &obj));
             sp<PersistentSurface> surface(static_cast<PersistentSurface *>(obj.get()));
@@ -1445,7 +1479,7 @@ void CCodec::onMessageReceived(const sp<AMessage> &msg) {
             break;
         }
         case kWhatSetParameters: {
-            setDeadline(now + 50ms, "setParameters");
+            setDeadline(now, 50ms, "setParameters");
             sp<AMessage> params;
             CHECK(msg->findMessage("params", &params));
             setParameters(params);
@@ -1542,12 +1576,16 @@ void CCodec::onMessageReceived(const sp<AMessage> &msg) {
             break;
         }
     }
-    setDeadline(TimePoint::max(), "none");
+    setDeadline(TimePoint::max(), 0ms, "none");
 }
 
-void CCodec::setDeadline(const TimePoint &newDeadline, const char *name) {
+void CCodec::setDeadline(
+        const TimePoint &now,
+        const std::chrono::milliseconds &timeout,
+        const char *name) {
+    int32_t mult = std::max(1, property_get_int32("debug.stagefright.ccodec_timeout_mult", 1));
     Mutexed<NamedTimePoint>::Locked deadline(mDeadline);
-    deadline->set(newDeadline, name);
+    deadline->set(now + (timeout * mult), name);
 }
 
 void CCodec::initiateReleaseIfStuck() {
