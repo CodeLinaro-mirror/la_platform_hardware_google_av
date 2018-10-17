@@ -449,13 +449,14 @@ struct CCodec::ClientListener : public Codec2Client::Listener {
 
     virtual void onWorkDone(
             const std::weak_ptr<Codec2Client::Component>& component,
-            std::list<std::unique_ptr<C2Work>>& workItems) override {
+            std::list<std::unique_ptr<C2Work>>& workItems,
+            size_t numDiscardedInputBuffers) override {
         (void)component;
         sp<CCodec> codec(mCodec.promote());
         if (!codec) {
             return;
         }
-        codec->onWorkDone(workItems);
+        codec->onWorkDone(workItems, numDiscardedInputBuffers);
     }
 
     virtual void onTripped(
@@ -1293,6 +1294,10 @@ void CCodec::flush() {
 
     std::list<std::unique_ptr<C2Work>> flushedWork;
     c2_status_t err = comp->flush(C2Component::FLUSH_COMPONENT, &flushedWork);
+    {
+        Mutexed<std::list<std::unique_ptr<C2Work>>>::Locked queue(mWorkDoneQueue);
+        flushedWork.splice(flushedWork.end(), *queue);
+    }
     if (err != C2_OK) {
         // TODO: convert err into status_t
         mCallback->onError(UNKNOWN_ERROR, ACTION_CODE_FATAL);
@@ -1423,10 +1428,22 @@ void CCodec::signalRequestIDRFrame() {
     config->setParameters(comp, params, C2_MAY_BLOCK);
 }
 
-void CCodec::onWorkDone(std::list<std::unique_ptr<C2Work>> &workItems) {
-    {
-        Mutexed<std::list<std::unique_ptr<C2Work>>>::Locked queue(mWorkDoneQueue);
-        queue->splice(queue->end(), workItems);
+void CCodec::onWorkDone(std::list<std::unique_ptr<C2Work>> &workItems,
+                        size_t numDiscardedInputBuffers) {
+    if (!workItems.empty()) {
+        {
+            Mutexed<std::list<size_t>>::Locked numDiscardedInputBuffersQueue(
+                    mNumDiscardedInputBuffersQueue);
+            numDiscardedInputBuffersQueue->insert(
+                    numDiscardedInputBuffersQueue->end(),
+                    workItems.size() - 1, 0);
+            numDiscardedInputBuffersQueue->emplace_back(
+                    numDiscardedInputBuffers);
+        }
+        {
+            Mutexed<std::list<std::unique_ptr<C2Work>>>::Locked queue(mWorkDoneQueue);
+            queue->splice(queue->end(), workItems);
+        }
     }
     (new AMessage(kWhatWorkDone, this))->post();
 }
@@ -1502,6 +1519,7 @@ void CCodec::onMessageReceived(const sp<AMessage> &msg) {
         }
         case kWhatWorkDone: {
             std::unique_ptr<C2Work> work;
+            size_t numDiscardedInputBuffers;
             bool shouldPost = false;
             {
                 Mutexed<std::list<std::unique_ptr<C2Work>>>::Locked queue(mWorkDoneQueue);
@@ -1512,11 +1530,24 @@ void CCodec::onMessageReceived(const sp<AMessage> &msg) {
                 queue->pop_front();
                 shouldPost = !queue->empty();
             }
+            {
+                Mutexed<std::list<size_t>>::Locked numDiscardedInputBuffersQueue(
+                        mNumDiscardedInputBuffersQueue);
+                if (numDiscardedInputBuffersQueue->empty()) {
+                    numDiscardedInputBuffers = 0;
+                } else {
+                    numDiscardedInputBuffers = numDiscardedInputBuffersQueue->front();
+                    numDiscardedInputBuffersQueue->pop_front();
+                }
+            }
             if (shouldPost) {
                 (new AMessage(kWhatWorkDone, this))->post();
             }
 
-            subQueuedWorkCount(1);
+            if (work->worklets.empty()
+                    || !(work->worklets.front()->output.flags & C2FrameData::FLAG_INCOMPLETE)) {
+                subQueuedWorkCount(1);
+            }
             // handle configuration changes in work done
             Mutexed<Config>::Locked config(mConfig);
             bool changed = false;
@@ -1579,7 +1610,8 @@ void CCodec::onMessageReceived(const sp<AMessage> &msg) {
             }
             mChannel->onWorkDone(
                     std::move(work), changed ? config->mOutputFormat : nullptr,
-                    initData.hasChanged() ? initData.update().get() : nullptr);
+                    initData.hasChanged() ? initData.update().get() : nullptr,
+                    numDiscardedInputBuffers);
             break;
         }
         case kWhatWatch: {
