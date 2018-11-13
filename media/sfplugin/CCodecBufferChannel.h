@@ -125,10 +125,14 @@ public:
      * @param workItems   finished work item.
      * @param outputFormat new output format if it has changed, otherwise nullptr
      * @param initData    new init data (CSD) if it has changed, otherwise nullptr
+     * @param numDiscardedInputBuffers the number of input buffers that are
+     *                    returned for the first time (not previously returned by
+     *                    onInputBufferDone()).
      */
     void onWorkDone(
             std::unique_ptr<C2Work> work, const sp<AMessage> &outputFormat,
-            const C2StreamInitDataInfo::output *initData);
+            const C2StreamInitDataInfo::output *initData,
+            size_t numDiscardedInputBuffers);
 
     /**
      * Make an input buffer available for the client as it is no longer needed
@@ -257,38 +261,45 @@ private:
 
     // PipelineCapacity is used in the input buffer gating logic.
     //
-    // There are two criteria that need to be met before
+    // There are three criteria that need to be met before
     // onInputBufferAvailable() is called:
-    // 1. The number of work items that have been received by
+    // 1. The number of input buffers that have been received by
+    //    CCodecBufferChannel but not returned via onWorkDone() or
+    //    onInputBufferDone() does not exceed a certain limit. (Let us call this
+    //    number the "input" capacity.)
+    // 2. The number of work items that have been received by
     //    CCodecBufferChannel whose outputs have not been returned from the
     //    component (by calling onWorkDone()) does not exceed a certain limit.
-    //    Let us call this the "component" capacity.
-    // 2. The number of work items that have been received by
+    //    (Let us call this the "component" capacity.)
+    // 3. The number of work items that have been received by
     //    CCodecBufferChannel whose outputs have not been released by the app
     //    (either by calling discardBuffer() on an output buffer or calling
-    //    renderOutputBuffer()) does not exceed a certain limit. Let us call
-    //    this the "output" capacity.
+    //    renderOutputBuffer()) does not exceed a certain limit. (Let us call
+    //    this the "output" capacity.)
     //
-    // These two criteria guarantee that the new input buffer that arrives from
+    // These three criteria guarantee that a new input buffer that arrives from
     // the invocation of onInputBufferAvailable() will not
-    // 1. overload the component; or
-    // 2. overload CCodecBufferChannel's output buffers if the component
+    // 1. overload CCodecBufferChannel's input buffers;
+    // 2. overload the component; or
+    // 3. overload CCodecBufferChannel's output buffers if the component
     //    finishes all the pending work right away.
     //
     struct PipelineCapacity {
+        // The number of available input capacity.
+        std::atomic_int input;
         // The number of available component capacity.
         std::atomic_int component;
         // The number of available output capacity.
         std::atomic_int output;
 
         PipelineCapacity();
-        // Set the values of component and output.
-        void initialize(int newComponent, int newOutput,
+        // Set the values of #component and #output.
+        void initialize(int newInput, int newComponent, int newOutput,
                         const char* newName = "<UNKNOWN COMPONENT>",
                         const char* callerTag = nullptr);
 
-        // Return true and decrease component and output by one if they are both
-        // greater than zero; return false otherwise.
+        // Return true and decrease #input, #component and #output by one if
+        // they are all greater than zero; return false otherwise.
         //
         // callerTag is used for logging only.
         //
@@ -297,28 +308,40 @@ private:
         // onInputBufferAvailable() can (and will) be called afterwards.
         bool allocate(const char* callerTag = nullptr);
 
-        // Increase component and output by one.
+        // Increase #input, #component and #output by one.
         //
         // callerTag is used for logging only.
         //
         // free() is called by CCodecBufferChannel after allocate() returns true
-        // but onInputBufferAvailable() cannot be called for any reasons.
+        // but onInputBufferAvailable() cannot be called for any reasons. It
+        // essentially undoes an allocate() call.
         void free(const char* callerTag = nullptr);
 
-        // Increase component by one and return the updated value.
+        // Increase #input by @p numDiscardedInputBuffers.
         //
         // callerTag is used for logging only.
         //
-        // freeComponentSlot() is called by CCodecBufferChannel when onWorkDone() is
-        // called.
+        // freeInputSlots() is called by CCodecBufferChannel when onWorkDone()
+        // or onInputBufferDone() is called. @p numDiscardedInputBuffers is
+        // provided in onWorkDone(), and is 1 in onInputBufferDone().
+        int freeInputSlots(size_t numDiscardedInputBuffers,
+                           const char* callerTag = nullptr);
+
+        // Increase #component by one and return the updated value.
+        //
+        // callerTag is used for logging only.
+        //
+        // freeComponentSlot() is called by CCodecBufferChannel when
+        // onWorkDone() is called.
         int freeComponentSlot(const char* callerTag = nullptr);
 
-        // Increase output by one and return the updated value.
+        // Increase #output by one and return the updated value.
         //
         // callerTag is used for logging only.
         //
-        // freeOutputSlot() is called by CCodecBufferChannel when discardBuffer() is
-        // called on an output buffer or when renderOutputBuffer() is called.
+        // freeOutputSlot() is called by CCodecBufferChannel when
+        // discardBuffer() is called on an output buffer or when
+        // renderOutputBuffer() is called.
         int freeOutputSlot(const char* callerTag = nullptr);
 
     private:
