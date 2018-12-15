@@ -327,7 +327,10 @@ IA_ERRORCODE C2SoftXaacDec::initDecoder() {
         return IA_FATAL_ERROR;
     }
 
-    mOutputDrainBuffer = new short[kOutputDrainBufferSize];
+    if (!mOutputDrainBuffer) {
+        mOutputDrainBuffer = new (std::nothrow) char[kOutputDrainBufferSize];
+        if (!mOutputDrainBuffer) return IA_FATAL_ERROR;
+    }
 
     err_code = initXAACDrc();
     RETURN_IF_FATAL(err_code,  "initXAACDrc");
@@ -357,7 +360,11 @@ void C2SoftXaacDec::finishWork(const std::unique_ptr<C2Work>& work,
     // TODO: error handling, proper usage, etc.
     c2_status_t err =
         pool->fetchLinearBlock(mOutputDrainBufferWritePos, usage, &block);
-    if (err != C2_OK) ALOGE("err = %d", err);
+    if (err != C2_OK) {
+        ALOGE("fetchLinearBlock failed : err = %d", err);
+        work->result = C2_NO_MEMORY;
+        return;
+    }
     C2WriteView wView = block->map().get();
     int16_t* outBuffer = reinterpret_cast<int16_t*>(wView.data());
     memcpy(outBuffer, mOutputDrainBuffer, mOutputDrainBufferWritePos);
@@ -387,9 +394,12 @@ void C2SoftXaacDec::finishWork(const std::unique_ptr<C2Work>& work,
 
 void C2SoftXaacDec::process(const std::unique_ptr<C2Work>& work,
                          const std::shared_ptr<C2BlockPool>& pool) {
-    work->workletsProcessed = 0u;
+    // Initialize output work
     work->result = C2_OK;
+    work->workletsProcessed = 1u;
     work->worklets.front()->output.configUpdate.clear();
+    work->worklets.front()->output.flags = work->input.flags;
+
     if (mSignalledError || mSignalledOutputEos) {
         work->result = C2_BAD_VALUE;
         return;
@@ -412,7 +422,6 @@ void C2SoftXaacDec::process(const std::unique_ptr<C2Work>& work,
     bool eos = (work->input.flags & C2FrameData::FLAG_END_OF_STREAM) != 0;
     bool codecConfig =
         (work->input.flags & C2FrameData::FLAG_CODEC_CONFIG) != 0;
-
     if (codecConfig) {
         if (size == 0u) {
             ALOGE("empty codec config");
@@ -435,13 +444,13 @@ void C2SoftXaacDec::process(const std::unique_ptr<C2Work>& work,
         work->worklets.front()->output.flags = work->input.flags;
         work->worklets.front()->output.ordinal = work->input.ordinal;
         work->worklets.front()->output.buffers.clear();
-        work->workletsProcessed = 1u;
         return;
     }
 
     mCurFrameIndex = work->input.ordinal.frameIndex.peeku();
     mCurTimestamp = work->input.ordinal.timestamp.peeku();
     mOutputDrainBufferWritePos = 0;
+    char* tempOutputDrainBuffer = mOutputDrainBuffer;
     while (size > 0u) {
         if ((kOutputDrainBufferSize * sizeof(int16_t) -
              mOutputDrainBufferWritePos) <
@@ -537,7 +546,7 @@ void C2SoftXaacDec::process(const std::unique_ptr<C2Work>& work,
                     work->worklets.front()->output.configUpdate.push_back(
                         C2Param::Copy(channelCountInfo));
                 } else {
-                    ALOGE("Cannot set width and height");
+                    ALOGE("Config Update failed");
                     mSignalledError = true;
                     work->result = C2_CORRUPTED;
                     return;
@@ -588,7 +597,8 @@ void C2SoftXaacDec::process(const std::unique_ptr<C2Work>& work,
 
             // fall through
         }
-        memcpy(mOutputDrainBuffer, mOutputBuffer, mNumOutBytes);
+        memcpy(tempOutputDrainBuffer, mOutputBuffer, mNumOutBytes);
+        tempOutputDrainBuffer += mNumOutBytes;
         mOutputDrainBufferWritePos += mNumOutBytes;
     }
 
@@ -911,7 +921,7 @@ IA_ERRORCODE C2SoftXaacDec::deInitXAACDecoder() {
 
     /* Irrespective of error returned in IA_API_CMD_INPUT_OVER, free allocated memory */
     for (void* buf : mMemoryVec) {
-        free(buf);
+        if (buf) free(buf);
     }
     mMemoryVec.clear();
     mXheaacCodecHandle = nullptr;
@@ -923,7 +933,7 @@ IA_ERRORCODE C2SoftXaacDec::deInitMPEGDDDrc() {
     ALOGV("deInitMPEGDDDrc");
 
     for (void* buf : mDrcMemoryVec) {
-        free(buf);
+        if (buf) free(buf);
     }
     mDrcMemoryVec.clear();
     return IA_NO_ERROR;
