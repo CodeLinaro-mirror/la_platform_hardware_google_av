@@ -1348,9 +1348,7 @@ void CCodec::signalResume() {
 }
 
 void CCodec::signalSetParameters(const sp<AMessage> &params) {
-    sp<AMessage> msg = new AMessage(kWhatSetParameters, this);
-    msg->setMessage("params", params);
-    msg->post();
+    setParameters(params);
 }
 
 void CCodec::setParameters(const sp<AMessage> &params) {
@@ -1515,13 +1513,6 @@ void CCodec::onMessageReceived(const sp<AMessage> &msg) {
             setInputSurface(surface);
             break;
         }
-        case kWhatSetParameters: {
-            setDeadline(now, 50ms, "setParameters");
-            sp<AMessage> params;
-            CHECK(msg->findMessage("params", &params));
-            setParameters(params);
-            break;
-        }
         case kWhatWorkDone: {
             std::unique_ptr<C2Work> work;
             size_t numDiscardedInputBuffers;
@@ -1594,6 +1585,7 @@ void CCodec::onMessageReceived(const sp<AMessage> &msg) {
                     C2StreamColorAspectsInfo::output::PARAM_TYPE,
                     C2StreamDataSpaceInfo::output::PARAM_TYPE,
                     C2StreamHdrStaticInfo::output::PARAM_TYPE,
+                    C2StreamHdr10PlusInfo::output::PARAM_TYPE,
                     C2StreamPixelAspectRatioInfo::output::PARAM_TYPE,
                     C2StreamSurfaceScalingInfo::output::PARAM_TYPE
                 };
