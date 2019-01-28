@@ -787,8 +787,13 @@ public:
     std::unique_ptr<CCodecBufferChannel::InputBuffers> toArrayMode(
             size_t size) final {
         int32_t capacity = kLinearBufferSize;
-        (void)mFormat->findInt32(C2_NAME_STREAM_MAX_BUFFER_SIZE_SETTING, &capacity);
-
+        (void)mFormat->findInt32(KEY_MAX_INPUT_SIZE, &capacity);
+        if ((size_t)capacity > kMaxLinearBufferSize) {
+            ALOGD("client requested %d, capped to %zu", capacity, kMaxLinearBufferSize);
+            capacity = kMaxLinearBufferSize;
+        }
+        // TODO: proper max input size
+        // TODO: read usage from intf
         std::unique_ptr<InputBuffersArray> array(
                 new InputBuffersArray(mComponentName.c_str(), "1D-Input[N]"));
         array->setPool(mPool);
@@ -1883,6 +1888,11 @@ status_t CCodecBufferChannel::renderOutputBuffer(
         std::static_pointer_cast<const C2StreamHdrStaticInfo::output>(
                 c2Buffer->getInfo(C2StreamHdrStaticInfo::output::PARAM_TYPE));
 
+    // HDR10 plus info
+    std::shared_ptr<const C2StreamHdr10PlusInfo::output> hdr10PlusInfo =
+        std::static_pointer_cast<const C2StreamHdr10PlusInfo::output>(
+                c2Buffer->getInfo(C2StreamHdr10PlusInfo::output::PARAM_TYPE));
+
     {
         Mutexed<OutputSurface>::Locked output(mOutputSurface);
         if (output->surface == nullptr) {
@@ -1910,33 +1920,41 @@ status_t CCodecBufferChannel::renderOutputBuffer(
             videoScalingMode,
             transform,
             Fence::NO_FENCE, 0);
-    if (hdrStaticInfo) {
-        struct android_smpte2086_metadata smpte2086_meta = {
-            .displayPrimaryRed = {
-                hdrStaticInfo->mastering.red.x, hdrStaticInfo->mastering.red.y
-            },
-            .displayPrimaryGreen = {
-                hdrStaticInfo->mastering.green.x, hdrStaticInfo->mastering.green.y
-            },
-            .displayPrimaryBlue = {
-                hdrStaticInfo->mastering.blue.x, hdrStaticInfo->mastering.blue.y
-            },
-            .whitePoint = {
-                hdrStaticInfo->mastering.white.x, hdrStaticInfo->mastering.white.y
-            },
-            .maxLuminance = hdrStaticInfo->mastering.maxLuminance,
-            .minLuminance = hdrStaticInfo->mastering.minLuminance,
-        };
-
-        struct android_cta861_3_metadata cta861_meta = {
-            .maxContentLightLevel = hdrStaticInfo->maxCll,
-            .maxFrameAverageLightLevel = hdrStaticInfo->maxFall,
-        };
-
+    if (hdrStaticInfo || hdr10PlusInfo) {
         HdrMetadata hdr;
-        hdr.validTypes = HdrMetadata::SMPTE2086 | HdrMetadata::CTA861_3;
-        hdr.smpte2086 = smpte2086_meta;
-        hdr.cta8613 = cta861_meta;
+        if (hdrStaticInfo) {
+            struct android_smpte2086_metadata smpte2086_meta = {
+                .displayPrimaryRed = {
+                    hdrStaticInfo->mastering.red.x, hdrStaticInfo->mastering.red.y
+                },
+                .displayPrimaryGreen = {
+                    hdrStaticInfo->mastering.green.x, hdrStaticInfo->mastering.green.y
+                },
+                .displayPrimaryBlue = {
+                    hdrStaticInfo->mastering.blue.x, hdrStaticInfo->mastering.blue.y
+                },
+                .whitePoint = {
+                    hdrStaticInfo->mastering.white.x, hdrStaticInfo->mastering.white.y
+                },
+                .maxLuminance = hdrStaticInfo->mastering.maxLuminance,
+                .minLuminance = hdrStaticInfo->mastering.minLuminance,
+            };
+
+            struct android_cta861_3_metadata cta861_meta = {
+                .maxContentLightLevel = hdrStaticInfo->maxCll,
+                .maxFrameAverageLightLevel = hdrStaticInfo->maxFall,
+            };
+
+            hdr.validTypes = HdrMetadata::SMPTE2086 | HdrMetadata::CTA861_3;
+            hdr.smpte2086 = smpte2086_meta;
+            hdr.cta8613 = cta861_meta;
+        }
+        if (hdr10PlusInfo) {
+            hdr.validTypes |= HdrMetadata::HDR10PLUS;
+            hdr.hdr10plus.assign(
+                    hdr10PlusInfo->m.value,
+                    hdr10PlusInfo->m.value + hdr10PlusInfo->flexCount());
+        }
         qbi.setHdrMetadata(hdr);
     }
     // we don't have dirty regions
@@ -2109,6 +2127,7 @@ status_t CCodecBufferChannel::start(
             pools->inputPool = pool;
         }
 
+        bool forceArrayMode = false;
         Mutexed<std::unique_ptr<InputBuffers>>::Locked buffers(mInputBuffers);
         if (graphic) {
             if (mInputSurface) {
@@ -2140,6 +2159,7 @@ status_t CCodecBufferChannel::start(
                 }
                 buffers->reset(new EncryptedLinearInputBuffers(
                         secure, mDealer, mCrypto, mHeapSeqNum, (size_t)capacity, mName));
+                forceArrayMode = true;
             } else {
                 buffers->reset(new LinearInputBuffers(mName));
             }
@@ -2150,6 +2170,10 @@ status_t CCodecBufferChannel::start(
             (*buffers)->setPool(pool);
         } else {
             // TODO: error
+        }
+
+        if (forceArrayMode) {
+            *buffers = (*buffers)->toArrayMode(kMinInputBufferArraySize);
         }
     }
 
