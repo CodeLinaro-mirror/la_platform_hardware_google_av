@@ -31,9 +31,6 @@ cc_library_shared {
             "signed-integer-overflow",
         ],
         cfi: true,
-        diag: {
-            cfi: true,
-        },
     },
 
     ldflags: ["-Wl,-Bsymbolic"],
@@ -117,9 +114,9 @@ cc_library_shared {
     ],
 
     shared_libs: [
+        "libcodec2",
         "libcutils",
         "liblog",
-        "libstagefright_codec2",
         "libstagefright_codec2_vndk",
         "libstagefright_foundation",
         "libutils",

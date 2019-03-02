@@ -18,12 +18,16 @@ cc_library_shared {
 
     shared_libs: [
         "libbase",
+        "libcodec2",
         "libcutils",
         "liblog",
-        "libstagefright_codec2",
         "libstagefright_codec2_vndk",
         "libstagefright_foundation",
         "libutils",
+    ],
+
+    static_libs: [
+        "libyuv_static",
     ],
 
     sanitize: {
@@ -32,8 +36,5 @@ cc_library_shared {
             "unsigned-integer-overflow",
             "signed-integer-overflow",
         ],
-        diag: {
-            cfi: true,
-        },
     },
 }
