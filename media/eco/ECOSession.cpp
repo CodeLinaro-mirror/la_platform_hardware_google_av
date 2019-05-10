@@ -17,7 +17,6 @@
 //#define LOG_NDEBUG 0
 #define LOG_TAG "ECOSession"
 //#define DEBUG_ECO_SESSION
-
 #include "eco/ECOSession.h"
 
 #include <binder/BinderService.h>
@@ -26,6 +25,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <sys/types.h>
+#include <utils/Log.h>
 
 #include <algorithm>
 #include <climits>
@@ -55,9 +55,10 @@ sp<ECOSession> ECOSession::createECOSession(int32_t width, int32_t height, bool 
     // Only support up to 720P and camera recording use case.
     // TODO(hkuang): Support the same resolution as in EAF. Also relax the isCameraRecording
     // as encoder may not konw it is from camera for some usage cases.
-    if (width > 1280 || height > 720 || width == 0 || height == 0 || isCameraRecording == false) {
-        ALOGD("Failed to create ECOSession with w: %d, h: %d, isCameraRecording: %d", width, height,
-              isCameraRecording);
+    if (width <= 0 || height <= 0 || width > 5120 || height > 5120 || width > 1280 * 720 / height ||
+        isCameraRecording == false) {
+        ECOLOGE("Failed to create ECOSession with w: %d, h: %d, isCameraRecording: %d", width,
+                height, isCameraRecording);
         return nullptr;
     }
     return new ECOSession(width, height, isCameraRecording);
@@ -72,26 +73,32 @@ ECOSession::ECOSession(int32_t width, int32_t height, bool isCameraRecording)
         mWidth(width),
         mHeight(height),
         mIsCameraRecording(isCameraRecording) {
-    ALOGD("ECOSession created with w: %d, h: %d, isCameraRecording: %d", mWidth, mHeight,
-          mIsCameraRecording);
-}
-
-void ECOSession::start() {
+    ECOLOGI("ECOSession created with w: %d, h: %d, isCameraRecording: %d", mWidth, mHeight,
+            mIsCameraRecording);
     mThread = std::thread(startThread, this);
+
+    // Read the debug properies.
+    mLogStats = property_get_bool(kDebugLogStats, false);
+    mLogStatsEntries = mLogStats ? property_get_int32(kDebugLogStatsSize, 0) : 0;
+
+    mLogInfo = property_get_bool(kDebugLogStats, false);
+    mLogInfoEntries = mLogInfo ? property_get_int32(kDebugLogInfosSize, 0) : 0;
+
+    ECOLOGI("ECOSession debug settings: logStats: %s, entries: %d, logInfo: %s entries: %d",
+            mLogStats ? "true" : "false", mLogStatsEntries, mLogInfo ? "true" : "false",
+            mLogInfoEntries);
 }
 
-void ECOSession::stop() {
+ECOSession::~ECOSession() {
     mStopThread = true;
 
     mStatsQueueWaitCV.notify_all();
     if (mThread.joinable()) {
-        ALOGD("ECOSession: join the thread");
+        ECOLOGD("ECOSession: join the thread");
         mThread.join();
     }
-}
-
-ECOSession::~ECOSession() {
-    stop();
+    ECOLOGI("ECOSession destroyed with w: %d, h: %d, isCameraRecording: %d", mWidth, mHeight,
+            mIsCameraRecording);
 }
 
 // static
@@ -100,7 +107,7 @@ void ECOSession::startThread(ECOSession* session) {
 }
 
 void ECOSession::run() {
-    ALOGD("ECOSession: starting main thread");
+    ECOLOGD("ECOSession: starting main thread");
 
     while (!mStopThread) {
         std::unique_lock<std::mutex> runLock(mStatsQueueLock);
@@ -114,19 +121,19 @@ void ECOSession::run() {
         }
     }
 
-    ALOGD("ECOSession: exiting main thread");
+    ECOLOGD("ECOSession: exiting main thread");
 }
 
 bool ECOSession::processStats(const ECOData& stats) {
     if (stats.getDataType() != ECOData::DATA_TYPE_STATS) {
-        ALOGE("Invalid stats. ECOData with type: %s", stats.getDataTypeString().c_str());
+        ECOLOGE("Invalid stats. ECOData with type: %s", stats.getDataTypeString().c_str());
         return false;
     }
 
     // Get the type of the stats.
     std::string statsType;
     if (stats.findString(KEY_STATS_TYPE, &statsType) != ECODataStatus::OK) {
-        ALOGE("Invalid stats ECOData without statsType");
+        ECOLOGE("Invalid stats ECOData without statsType");
         return false;
     }
 
@@ -135,7 +142,7 @@ bool ECOSession::processStats(const ECOData& stats) {
     } else if (statsType.compare(VALUE_STATS_TYPE_FRAME) == 0) {
         RETURN_IF_ERROR(processFrameStats(stats));
     } else {
-        ALOGE("processStats:: Failed to process stats as ECOData contains unknown stats type");
+        ECOLOGE("processStats:: Failed to process stats as ECOData contains unknown stats type");
         return false;
     }
 
@@ -143,7 +150,7 @@ bool ECOSession::processStats(const ECOData& stats) {
 }
 
 bool ECOSession::processSessionStats(const ECOData& stats) {
-    ALOGD("processSessionStats");
+    ECOLOGV("processSessionStats");
 
     ECOData info(ECOData::DATA_TYPE_INFO, systemTime(SYSTEM_TIME_BOOTTIME));
     info.setString(KEY_INFO_TYPE, VALUE_INFO_TYPE_SESSION);
@@ -153,21 +160,42 @@ bool ECOSession::processSessionStats(const ECOData& stats) {
         ECOData::ECODataKeyValuePair entry = iter.next();
         const std::string& key = entry.first;
         const ECOData::ECODataValueType value = entry.second;
-        ALOGD("Processing key: %s", key.c_str());
-        if (!key.compare(ENCODER_TYPE)) {
+        ECOLOGV("Processing key: %s", key.c_str());
+        if (!key.compare(KEY_STATS_TYPE)) {
+            // Skip the key KEY_STATS_TYPE as that has been parsed already.
+            continue;
+        } else if (!key.compare(ENCODER_TYPE)) {
             mCodecType = std::get<int32_t>(value);
+            ECOLOGV("codec type is %d", mCodecType);
         } else if (!key.compare(ENCODER_PROFILE)) {
             mCodecProfile = std::get<int32_t>(value);
+            ECOLOGV("codec profile is %d", mCodecProfile);
         } else if (!key.compare(ENCODER_LEVEL)) {
             mCodecLevel = std::get<int32_t>(value);
+            ECOLOGV("codec level is %d", mCodecLevel);
         } else if (!key.compare(ENCODER_TARGET_BITRATE_BPS)) {
             mBitrateBps = std::get<int32_t>(value);
+            ECOLOGV("codec bitrate is %d", mBitrateBps);
         } else if (!key.compare(ENCODER_KFI_FRAMES)) {
             mKeyFrameIntervalFrames = std::get<int32_t>(value);
+            ECOLOGV("codec kfi is %d", mKeyFrameIntervalFrames);
         } else if (!key.compare(ENCODER_FRAMERATE_FPS)) {
             mFramerateFps = std::get<float>(value);
+            ECOLOGV("codec framerate is %f", mFramerateFps);
+        } else if (!key.compare(ENCODER_INPUT_WIDTH)) {
+            int32_t width = std::get<int32_t>(value);
+            if (width != mWidth) {
+                ECOLOGW("Codec width: %d, expected: %d", width, mWidth);
+            }
+            ECOLOGV("codec width is %d", width);
+        } else if (!key.compare(ENCODER_INPUT_HEIGHT)) {
+            int32_t height = std::get<int32_t>(value);
+            if (height != mHeight) {
+                ECOLOGW("Codec height: %d, expected: %d", height, mHeight);
+            }
+            ECOLOGV("codec height is %d", height);
         } else {
-            ALOGW("Unknown frame stats key %s from provider.", key.c_str());
+            ECOLOGW("Unknown session stats key %s from provider.", key.c_str());
             continue;
         }
         info.set(key, value);
@@ -181,7 +209,7 @@ bool ECOSession::processSessionStats(const ECOData& stats) {
 }
 
 bool ECOSession::processFrameStats(const ECOData& stats) {
-    ALOGD("processFrameStats");
+    ECOLOGD("processFrameStats");
 
     bool needToNotifyListener = false;
     ECOData info(ECOData::DATA_TYPE_INFO, systemTime(SYSTEM_TIME_BOOTTIME));
@@ -192,7 +220,7 @@ bool ECOSession::processFrameStats(const ECOData& stats) {
         ECOData::ECODataKeyValuePair entry = iter.next();
         const std::string& key = entry.first;
         const ECOData::ECODataValueType value = entry.second;
-        ALOGD("Processing %s key", key.c_str());
+        ECOLOGD("Processing %s key", key.c_str());
 
         // Only process the keys that are supported by ECOService 1.0.
         if (!key.compare(FRAME_NUM) || !key.compare(FRAME_PTS_US) || !key.compare(FRAME_TYPE) ||
@@ -226,7 +254,7 @@ bool ECOSession::processFrameStats(const ECOData& stats) {
 
             info.set(key, value);
         } else {
-            ALOGW("Unknown frame stats key %s from provider.", key.c_str());
+            ECOLOGW("Unknown frame stats key %s from provider.", key.c_str());
         }
     }
 
@@ -240,24 +268,34 @@ bool ECOSession::processFrameStats(const ECOData& stats) {
 Status ECOSession::addStatsProvider(
         const sp<::android::media::eco::IECOServiceStatsProvider>& provider,
         const ::android::media::eco::ECOData& config, bool* status) {
-    ALOGV("%s: Add provider %p", __FUNCTION__, provider.get());
+    ::android::String16 name;
+    provider->getName(&name);
+
+    ECOLOGV("Try to add stats provider name: %s uid: %d pid %d", ::android::String8(name).string(),
+            IPCThreadState::self()->getCallingUid(), IPCThreadState::self()->getCallingPid());
 
     if (provider == nullptr) {
-        ALOGE("%s: provider must not be null", __FUNCTION__);
+        ECOLOGE("%s: provider must not be null", __FUNCTION__);
         *status = false;
         return STATUS_ERROR(ERROR_ILLEGAL_ARGUMENT, "Null provider given to addStatsProvider");
     }
 
+    std::scoped_lock<std::mutex> lock(mSessionLock);
+
     if (mProvider != nullptr) {
-        ALOGE("ECOService 1.0 only supports one stats provider");
+        ::android::String16 name;
+        mProvider->getName(&name);
+        String8 errorMsg = String8::format(
+                "ECOService 1.0 only supports one stats provider, current provider: %s",
+                ::android::String8(name).string());
+        ECOLOGE("%s", errorMsg.string());
         *status = false;
-        return STATUS_ERROR(ERROR_ALREADY_EXISTS,
-                            "ECOService 1.0 only supports one stats provider");
+        return STATUS_ERROR(ERROR_ALREADY_EXISTS, errorMsg.string());
     }
 
     // TODO: Handle the provider config.
     if (config.getDataType() != ECOData::DATA_TYPE_STATS_PROVIDER_CONFIG) {
-        ALOGE("Provider config is invalid");
+        ECOLOGE("Provider config is invalid");
         *status = false;
         return STATUS_ERROR(ERROR_ILLEGAL_ARGUMENT, "Provider config is invalid");
     }
@@ -268,38 +306,46 @@ Status ECOSession::addStatsProvider(
 }
 
 Status ECOSession::removeStatsProvider(
-        const sp<::android::media::eco::IECOServiceStatsProvider>& /* listener */,
-        bool* /* _aidl_return */) {
-    //TODO(hkuang): Add implementation.
+        const sp<::android::media::eco::IECOServiceStatsProvider>& provider, bool* status) {
+    std::scoped_lock<std::mutex> lock(mSessionLock);
+    // Check if the provider is the same as current provider for the session.
+    if (provider.get() != mProvider.get()) {
+        *status = false;
+        return STATUS_ERROR(ERROR_ILLEGAL_ARGUMENT, "Provider does not match");
+    }
+
+    mProvider = nullptr;
+    *status = true;
     return binder::Status::ok();
 }
 
 Status ECOSession::addInfoListener(
         const sp<::android::media::eco::IECOServiceInfoListener>& listener,
         const ::android::media::eco::ECOData& config, bool* status) {
-    ALOGD("%s: Add listener %p", __FUNCTION__, listener.get());
+    ALOGV("%s: Add listener %p", __FUNCTION__, listener.get());
+    std::scoped_lock<std::mutex> lock(mSessionLock);
 
     if (mListener != nullptr) {
-        ALOGE("ECOService 1.0 only supports one info listener");
+        ECOLOGE("ECOService 1.0 only supports one listener");
         *status = false;
-        return STATUS_ERROR(ERROR_ALREADY_EXISTS, "ECOService 1.0 only supports one info listener");
+        return STATUS_ERROR(ERROR_ALREADY_EXISTS, "ECOService 1.0 only supports one listener");
     }
 
     if (listener == nullptr) {
-        ALOGE("%s: listener must not be null", __FUNCTION__);
+        ECOLOGE("%s: listener must not be null", __FUNCTION__);
         *status = false;
         return STATUS_ERROR(ERROR_ILLEGAL_ARGUMENT, "Null listener given to addInfoListener");
     }
 
     if (config.getDataType() != ECOData::DATA_TYPE_INFO_LISTENER_CONFIG) {
         *status = false;
-        ALOGE("%s: listener config is invalid", __FUNCTION__);
+        ECOLOGE("%s: listener config is invalid", __FUNCTION__);
         return STATUS_ERROR(ERROR_ILLEGAL_ARGUMENT, "listener config is invalid");
     }
 
     if (config.isEmpty()) {
         *status = false;
-        ALOGE("Listener must provide listening criterion");
+        ECOLOGE("Listener must provide listening criterion");
         return STATUS_ERROR(ERROR_ILLEGAL_ARGUMENT, "listener config is empty");
     }
 
@@ -311,9 +357,15 @@ Status ECOSession::addInfoListener(
         mListenerQpCondition.mQpBlocknessThreshold < ENCODER_MIN_QP ||
         mListenerQpCondition.mQpBlocknessThreshold > ENCODER_MAX_QP) {
         *status = false;
-        ALOGE("%s: listener config is invalid", __FUNCTION__);
+        ECOLOGE("%s: listener config is invalid", __FUNCTION__);
         return STATUS_ERROR(ERROR_ILLEGAL_ARGUMENT, "listener config is not valid");
     }
+
+    ::android::String16 name;
+    listener->getName(&name);
+
+    ECOLOGD("Info listener name: %s uid: %d pid %d", ::android::String8(name).string(),
+            IPCThreadState::self()->getCallingUid(), IPCThreadState::self()->getCallingPid());
 
     mListener = listener;
     *status = true;
@@ -321,14 +373,21 @@ Status ECOSession::addInfoListener(
 }
 
 Status ECOSession::removeInfoListener(
-        const sp<::android::media::eco::IECOServiceInfoListener>& /* provider */,
-        bool* /* _aidl_return */) {
-    //TODO(hkuang): Add implementation.
+        const sp<::android::media::eco::IECOServiceInfoListener>& listener, bool* _aidl_return) {
+    std::scoped_lock<std::mutex> lock(mSessionLock);
+    // Check if the listener is the same as current listener for the session.
+    if (listener.get() != mListener.get()) {
+        *_aidl_return = false;
+        return STATUS_ERROR(ERROR_ILLEGAL_ARGUMENT, "Listener does not match");
+    }
+
+    mListener = nullptr;
+    *_aidl_return = true;
     return binder::Status::ok();
 }
 
 Status ECOSession::pushNewStats(const ::android::media::eco::ECOData& stats, bool*) {
-    ALOGD("ECOSession get new stats type: %s", stats.getDataTypeString().c_str());
+    ECOLOGV("ECOSession get new stats type: %s", stats.getDataTypeString().c_str());
     std::unique_lock<std::mutex> lock(mStatsQueueLock);
     mStatsQueue.push_back(stats);
     mStatsQueueWaitCV.notify_all();
@@ -336,27 +395,55 @@ Status ECOSession::pushNewStats(const ::android::media::eco::ECOData& stats, boo
 }
 
 Status ECOSession::getWidth(int32_t* _aidl_return) {
+    std::scoped_lock<std::mutex> lock(mSessionLock);
     *_aidl_return = mWidth;
     return binder::Status::ok();
 }
 
 Status ECOSession::getHeight(int32_t* _aidl_return) {
+    std::scoped_lock<std::mutex> lock(mSessionLock);
     *_aidl_return = mHeight;
     return binder::Status::ok();
 }
 
 Status ECOSession::getNumOfListeners(int32_t* _aidl_return) {
+    std::scoped_lock<std::mutex> lock(mSessionLock);
     *_aidl_return = (mListener == nullptr ? 0 : 1);
     return binder::Status::ok();
 }
 
 Status ECOSession::getNumOfProviders(int32_t* _aidl_return) {
+    std::scoped_lock<std::mutex> lock(mSessionLock);
     *_aidl_return = (mProvider == nullptr ? 0 : 1);
     return binder::Status::ok();
 }
 
 /*virtual*/ void ECOSession::binderDied(const wp<IBinder>& /*who*/) {
-    ALOGV("binderDied");
+    ECOLOGV("binderDied");
+}
+
+void ECOSession::logStats(const ECOData& data) {
+    // Check if mLogStats is true;
+    if (!mLogStats || mLogStatsEntries == 0) return;
+
+    // Check if we need to remove the old entry.
+    if (mStatsDebugBuffer.size() >= mLogStatsEntries) {
+        mStatsDebugBuffer.pop_front();
+    }
+
+    mStatsDebugBuffer.push_back(data);
+}
+
+void ECOSession::logInfos(const ECOData& data) {
+    // Check if mLogInfo is true;
+    if (!mLogInfo || mLogInfoEntries == 0) return;
+
+    // Check if we need to remove the old entry.
+    if (mInfosDebugBuffer.size() >= mLogInfoEntries) {
+        mInfosDebugBuffer.pop_front();
+    }
+
+    mInfosDebugBuffer.push_back(data);
 }
 
 }  // namespace eco
