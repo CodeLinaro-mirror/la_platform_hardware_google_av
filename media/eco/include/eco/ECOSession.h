@@ -55,21 +55,18 @@ class ECOSession : public BinderService<ECOSession>,
 public:
     virtual ~ECOSession();
 
-    virtual Status addStatsProvider(
-            const sp<::android::media::eco::IECOServiceStatsProvider>& provider,
-            const ::android::media::eco::ECOData& statsConfig, /*out*/ bool* status);
+    virtual Status addStatsProvider(const sp<IECOServiceStatsProvider>& provider,
+                                    const ECOData& statsConfig, /*out*/ bool* status);
 
-    virtual Status removeStatsProvider(const sp<::android::media::eco::IECOServiceStatsProvider>&,
-                                       bool*);
+    virtual Status removeStatsProvider(const sp<IECOServiceStatsProvider>&, bool*);
 
-    virtual Status addInfoListener(const sp<::android::media::eco::IECOServiceInfoListener>&,
-                                   const ::android::media::eco::ECOData& listenerConfig,
+    virtual Status addInfoListener(const sp<IECOServiceInfoListener>&,
+                                   const ECOData& listenerConfig,
                                    /*out*/ bool* status);
 
-    virtual Status removeInfoListener(const sp<::android::media::eco::IECOServiceInfoListener>&,
-                                      bool*);
+    virtual Status removeInfoListener(const sp<IECOServiceInfoListener>&, bool*);
 
-    virtual Status pushNewStats(const ::android::media::eco::ECOData&, bool*);
+    virtual Status pushNewStats(const ECOData&, bool*);
 
     virtual Status getWidth(int32_t* _aidl_return);
 
@@ -85,6 +82,9 @@ public:
     // Grant permission to EcoSessionTest to run test.
     friend class EcoSessionTest;
 
+    // Let ECOService create the session.
+    friend class ECOService;
+
 protected:
     static android::sp<ECOSession> createECOSession(int32_t width, int32_t height,
                                                     bool isCameraRecording);
@@ -93,18 +93,15 @@ private:
     // Only the  ECOService could create ECOSession.
     ECOSession(int32_t width, int32_t height, bool isCameraRecording);
 
-    // Start the ECOSession.
-    void start();
-
-    // Stop the ECOSession.
-    void stop();
-
     // Start the main thread for processing the stats and pushing info to listener.
     static void startThread(ECOSession* session);
 
     void run();
 
     bool processStats(const ECOData& stats);
+
+    // Lock guarding ECO session state
+    std::mutex mSessionLock;
 
     // Process the session stats received from provider.
     bool processSessionStats(const ECOData& stats);
@@ -137,13 +134,13 @@ private:
     std::thread mThread;
 
     // Width of the encoding session in number of pixels.
-    int32_t mWidth;
+    const int32_t mWidth;
 
     // Height of the encoding session in number of pixels.
-    int32_t mHeight;
+    const int32_t mHeight;
 
     // Whether the encoding is for camera recording.
-    bool mIsCameraRecording;
+    const bool mIsCameraRecording;
 
     // Encoder codec type of the encoding session. -1 means not available.
     int32_t mCodecType;
@@ -163,6 +160,21 @@ private:
 
     // Frame rate in frames per second. -1 means not available.
     float mFramerateFps;
+
+    // Debug related flags.
+    bool mLogStats;
+    uint32_t mLogStatsEntries;  // number of stats received from the provider.
+    std::list<ECOData> mStatsDebugBuffer;
+
+    // Pushes the ECOData to the debug buffer.
+    void logStats(const ECOData& data);
+
+    bool mLogInfo;
+    uint32_t mLogInfoEntries;  // number of infos sent to the listener.
+    std::list<ECOData> mInfosDebugBuffer;
+
+    // Pushes the ECOData to the debug buffer.
+    void logInfos(const ECOData& data);
 };
 
 }  // namespace eco
