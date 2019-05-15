@@ -56,13 +56,7 @@ public:
     sp<ECOSession> createSession(int32_t width, int32_t height, bool isCameraRecording) {
         mSession = ECOSession::createECOSession(width, height, isCameraRecording);
         if (mSession == nullptr) return nullptr;
-        mSession->start();
         return mSession;
-    }
-
-    ~EcoSessionTest() {
-        if (mSession != nullptr) mSession->stop();
-        ALOGD("EcoSessionTest destroyed");
     }
 
 private:
@@ -75,7 +69,8 @@ TEST_F(EcoSessionTest, TestConstructorWithInvalidParameters) {
                 nullptr);
 
     // Expects failure as ECOService1.0 will only support up to 720P and camera recording case.
-    EXPECT_TRUE(createSession(1920 /* width */, 1080 /* height */, false /* isCameraRecording */) == nullptr);
+    EXPECT_TRUE(createSession(1920 /* width */, 1080 /* height */, false /* isCameraRecording */) ==
+                nullptr);
 
     EXPECT_TRUE(createSession(1920 /* width */, -1 /* height */, true /* isCameraRecording */) ==
                 nullptr);
@@ -246,7 +241,9 @@ TEST_F(EcoSessionTest, TestSessionWithProviderAndListenerSimpleTest) {
             });
 
     // Inject the session stats into the ECOSession through fakeProvider.
-    SimpleEncoderConfig sessionEncoderConfig("google-avc", CodecTypeAVC, AVCProfileHigh, AVCLevel52, kTargetBitrateBps, kKeyFrameIntervalFrames, kFrameRate);
+    SimpleEncoderConfig sessionEncoderConfig("google-avc", CodecTypeAVC, AVCProfileHigh, AVCLevel52,
+                                             kTargetBitrateBps, kKeyFrameIntervalFrames,
+                                             kFrameRate);
     fakeProvider->injectSessionStats(sessionEncoderConfig.toEcoData(ECOData::DATA_TYPE_STATS));
 
     // Wait as ECOService may take some time to process.
@@ -409,6 +406,103 @@ TEST_F(EcoSessionTest, TestSessionWithProviderAndListenerSimpleTest) {
     EXPECT_EQ(frameQp, 41);
     EXPECT_TRUE(info.findInt32(FRAME_SIZE_BYTES, &frameSize) == ECODataStatus::OK);
     EXPECT_EQ(frameSize, 56);
+}
+
+TEST_F(EcoSessionTest, TestRemoveMatchProvider) {
+    sp<ECOSession> ecoSession = createSession(kTestWidth, kTestHeight, kIsCameraRecording);
+    EXPECT_TRUE(ecoSession);
+
+    sp<FakeECOServiceStatsProvider> fakeProvider1 = new FakeECOServiceStatsProvider(
+            kTestWidth, kTestHeight, kIsCameraRecording, kFrameRate, ecoSession);
+
+    ECOData providerConfig(ECOData::DATA_TYPE_STATS_PROVIDER_CONFIG,
+                           systemTime(SYSTEM_TIME_BOOTTIME));
+    bool res;
+    Status status = ecoSession->addStatsProvider(fakeProvider1, providerConfig, &res);
+    EXPECT_TRUE(res);
+    EXPECT_TRUE(status.isOk());
+
+    status = ecoSession->removeStatsProvider(fakeProvider1, &res);
+    EXPECT_TRUE(res);
+    EXPECT_TRUE(status.isOk());
+}
+
+TEST_F(EcoSessionTest, TestRemoveMisMatchProvider) {
+    sp<ECOSession> ecoSession = createSession(kTestWidth, kTestHeight, kIsCameraRecording);
+    EXPECT_TRUE(ecoSession);
+
+    sp<FakeECOServiceStatsProvider> fakeProvider1 = new FakeECOServiceStatsProvider(
+            kTestWidth, kTestHeight, kIsCameraRecording, kFrameRate, ecoSession);
+
+    ECOData providerConfig(ECOData::DATA_TYPE_STATS_PROVIDER_CONFIG,
+                           systemTime(SYSTEM_TIME_BOOTTIME));
+    bool res;
+    Status status = ecoSession->addStatsProvider(fakeProvider1, providerConfig, &res);
+    EXPECT_TRUE(res);
+    EXPECT_TRUE(status.isOk());
+
+    sp<FakeECOServiceStatsProvider> fakeProvider2 = new FakeECOServiceStatsProvider(
+            kTestWidth, kTestHeight, kIsCameraRecording, kFrameRate, ecoSession);
+
+    status = ecoSession->removeStatsProvider(fakeProvider2, &res);
+    EXPECT_FALSE(res);
+    EXPECT_FALSE(status.isOk());
+}
+
+TEST_F(EcoSessionTest, TestRemoveMatchListener) {
+    sp<ECOSession> ecoSession = createSession(kTestWidth, kTestHeight, kIsCameraRecording);
+    EXPECT_TRUE(ecoSession);
+
+    // Create listener.
+    sp<FakeECOServiceInfoListener> fakeListener =
+            new FakeECOServiceInfoListener(kTestWidth, kTestHeight, kIsCameraRecording, ecoSession);
+
+    // Create the listener config.
+    ECOData listenerConfig(ECOData::DATA_TYPE_INFO_LISTENER_CONFIG,
+                           systemTime(SYSTEM_TIME_BOOTTIME));
+    listenerConfig.setString(KEY_LISTENER_NAME, "FakeECOServiceInfoListener");
+    listenerConfig.setInt32(KEY_LISTENER_TYPE, ECOServiceInfoListener::INFO_LISTENER_TYPE_CAMERA);
+
+    // Specify the qp thresholds for receiving notification.
+    listenerConfig.setInt32(KEY_LISTENER_QP_BLOCKINESS_THRESHOLD, 40);
+    listenerConfig.setInt32(KEY_LISTENER_QP_CHANGE_THRESHOLD, 5);
+
+    bool res;
+    Status status = ecoSession->addInfoListener(fakeListener, listenerConfig, &res);
+
+    status = ecoSession->removeInfoListener(fakeListener, &res);
+    EXPECT_TRUE(res);
+    EXPECT_TRUE(status.isOk());
+}
+
+TEST_F(EcoSessionTest, TestRemoveMisMatchListener) {
+    sp<ECOSession> ecoSession = createSession(kTestWidth, kTestHeight, kIsCameraRecording);
+    EXPECT_TRUE(ecoSession);
+
+    // Create listener.
+    sp<FakeECOServiceInfoListener> fakeListener =
+            new FakeECOServiceInfoListener(kTestWidth, kTestHeight, kIsCameraRecording, ecoSession);
+
+    // Create the listener config.
+    ECOData listenerConfig(ECOData::DATA_TYPE_INFO_LISTENER_CONFIG,
+                           systemTime(SYSTEM_TIME_BOOTTIME));
+    listenerConfig.setString(KEY_LISTENER_NAME, "FakeECOServiceInfoListener");
+    listenerConfig.setInt32(KEY_LISTENER_TYPE, ECOServiceInfoListener::INFO_LISTENER_TYPE_CAMERA);
+
+    // Specify the qp thresholds for receiving notification.
+    listenerConfig.setInt32(KEY_LISTENER_QP_BLOCKINESS_THRESHOLD, 40);
+    listenerConfig.setInt32(KEY_LISTENER_QP_CHANGE_THRESHOLD, 5);
+
+    bool res;
+    Status status = ecoSession->addInfoListener(fakeListener, listenerConfig, &res);
+
+    // Create listener.
+    sp<FakeECOServiceInfoListener> fakeListener2 =
+            new FakeECOServiceInfoListener(kTestWidth, kTestHeight, kIsCameraRecording, ecoSession);
+
+    status = ecoSession->removeInfoListener(fakeListener2, &res);
+    EXPECT_FALSE(res);
+    EXPECT_FALSE(status.isOk());
 }
 
 }  // namespace eco
