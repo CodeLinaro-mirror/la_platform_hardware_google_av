@@ -8,3 +8,6 @@ echo "waiting for device"
 adb root && adb wait-for-device remount && adb sync
 
 adb shell /data/nativetest/EcoDataTest/EcoDataTest
+adb shell /data/nativetest/EcoSessionTest/EcoSessionTest
+#ECOService test lives in vendor side.
+adb shell data/nativetest/vendor/EcoServiceTest/EcoServiceTest
