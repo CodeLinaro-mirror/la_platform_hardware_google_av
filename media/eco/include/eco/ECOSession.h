@@ -72,6 +72,8 @@ public:
 
     virtual Status getHeight(int32_t* _aidl_return);
 
+    virtual Status getIsCameraRecording(bool*);
+
     virtual Status getNumOfListeners(int32_t*);
 
     virtual Status getNumOfProviders(int32_t*);
@@ -93,6 +95,8 @@ private:
     // Only the  ECOService could create ECOSession.
     ECOSession(int32_t width, int32_t height, bool isCameraRecording);
 
+    virtual status_t dump(int fd, const Vector<String16>& args);
+
     // Start the main thread for processing the stats and pushing info to listener.
     static void startThread(ECOSession* session);
 
@@ -104,16 +108,21 @@ private:
     std::mutex mSessionLock;
 
     // Process the session stats received from provider.
-    bool processSessionStats(const ECOData& stats);
+    void processSessionStats(const ECOData& stats);
 
     // Process the frame stats received from provider.
-    bool processFrameStats(const ECOData& stats);
+    void processFrameStats(const ECOData& stats);
+
+    // Generate the latest session info if available.
+    ECOData generateLatestSessionInfoEcoData();
 
     std::atomic<bool> mStopThread;
 
     std::mutex mStatsQueueLock;
     std::deque<ECOData> mStatsQueue;  // GUARDED_BY(mStatsQueueLock)
-    std::condition_variable mStatsQueueWaitCV;
+    std::condition_variable mWorkerWaitCV;
+
+    bool mNewListenerAdded = false;
 
     constexpr static int32_t ENCODER_MIN_QP = 0;
     constexpr static int32_t ENCODER_MAX_QP = 51;
@@ -128,7 +137,10 @@ private:
     QpCondition mListenerQpCondition;
 
     android::sp<IECOServiceInfoListener> mListener;
+    String16 mListenerName;
+
     android::sp<IECOServiceStatsProvider> mProvider;
+    String16 mProviderName;
 
     // Main thread for processing the events from provider.
     std::thread mThread;
@@ -142,21 +154,31 @@ private:
     // Whether the encoding is for camera recording.
     const bool mIsCameraRecording;
 
+    // Ouput width of the encoding session in number of pixels, -1 means not available.
+    int32_t mOutputWidth = -1;
+
+    // Output height of the encoding session in number of pixels. -1 means not available.
+    int32_t mOutputHeight = -1;
+
     // Encoder codec type of the encoding session. -1 means not available.
-    int32_t mCodecType;
+    int32_t mCodecType = -1;
 
     // Encoder codec profile. -1 means not available.
-    int32_t mCodecProfile;
+    int32_t mCodecProfile = -1;
 
     // Encoder codec level. -1 means not available.
-    int32_t mCodecLevel;
+    int32_t mCodecLevel = -1;
 
     // Target bitrate in bits per second. This should be provided by the provider. -1 means not
     // available.
-    int32_t mBitrateBps;
+    int32_t mTargetBitrateBps = -1;
+
+    // Actual bitrate in bits per second. This should be provided by the provider. -1 means not
+    // available.
+    int32_t mActualBitrateBps = -1;
 
     // Key frame interval in number of frames. -1 means not available.
-    int32_t mKeyFrameIntervalFrames;
+    int32_t mKeyFrameIntervalFrames = -1;
 
     // Frame rate in frames per second. -1 means not available.
     float mFramerateFps;
