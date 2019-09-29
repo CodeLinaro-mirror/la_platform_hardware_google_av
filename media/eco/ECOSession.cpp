@@ -209,13 +209,25 @@ void ECOSession::processSessionStats(const ECOData& stats) {
             if (width != mWidth) {
                 ECOLOGW("Codec width: %d, expected: %d", width, mWidth);
             }
-            ECOLOGV("codec width is %d", width);
+            ECOLOGV("codec input width is %d", width);
         } else if (!key.compare(ENCODER_INPUT_HEIGHT)) {
             int32_t height = std::get<int32_t>(value);
             if (height != mHeight) {
                 ECOLOGW("Codec height: %d, expected: %d", height, mHeight);
             }
-            ECOLOGV("codec height is %d", height);
+            ECOLOGV("codec input height is %d", height);
+        } else if (!key.compare(ENCODER_OUTPUT_WIDTH)) {
+            mOutputWidth = std::get<int32_t>(value);
+            if (mOutputWidth != mWidth) {
+                ECOLOGW("Codec output width: %d, expected: %d", mOutputWidth, mWidth);
+            }
+            ECOLOGV("codec output width is %d", mOutputWidth);
+        } else if (!key.compare(ENCODER_OUTPUT_HEIGHT)) {
+            mOutputHeight = std::get<int32_t>(value);
+            if (mOutputHeight != mHeight) {
+                ECOLOGW("Codec output height: %d, expected: %d", mOutputHeight, mHeight);
+            }
+            ECOLOGV("codec output height is %d", mOutputHeight);
         } else {
             ECOLOGW("Unknown session stats key %s from provider.", key.c_str());
             continue;
@@ -304,7 +316,8 @@ void ECOSession::processFrameStats(const ECOData& stats) {
             continue;
         } else if (!key.compare(FRAME_NUM) || !key.compare(FRAME_PTS_US) ||
                    !key.compare(FRAME_TYPE) || !key.compare(FRAME_SIZE_BYTES) ||
-                   !key.compare(ENCODER_ACTUAL_BITRATE_BPS)) {
+                   !key.compare(ENCODER_ACTUAL_BITRATE_BPS) ||
+                   !key.compare(ENCODER_FRAMERATE_FPS)) {
             // Only process the keys that are supported by ECOService 1.0.
             info.set(key, value);
         } else if (!key.compare(FRAME_AVG_QP)) {
@@ -497,11 +510,12 @@ Status ECOSession::removeInfoListener(
     return binder::Status::ok();
 }
 
-Status ECOSession::pushNewStats(const ::android::media::eco::ECOData& stats, bool*) {
+Status ECOSession::pushNewStats(const ::android::media::eco::ECOData& stats, bool* _aidl_return) {
     ECOLOGV("ECOSession get new stats type: %s", stats.getDataTypeString().c_str());
     std::unique_lock<std::mutex> lock(mStatsQueueLock);
     mStatsQueue.push_back(stats);
     mWorkerWaitCV.notify_all();
+    *_aidl_return = true;
     return binder::Status::ok();
 }
 
