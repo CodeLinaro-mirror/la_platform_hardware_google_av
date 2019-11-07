@@ -151,8 +151,9 @@ C2SoftAacEnc::C2SoftAacEnc(
       mNumBytesPerInputFrame(0u),
       mOutBufferSize(0u),
       mSentCodecSpecificData(false),
+      mInputTimeSet(false),
       mInputSize(0),
-      mInputTimeUs(-1ll),
+      mInputTimeUs(0),
       mSignalledError(false) {
 }
 
@@ -175,8 +176,9 @@ status_t C2SoftAacEnc::initEncoder() {
 
 c2_status_t C2SoftAacEnc::onStop() {
     mSentCodecSpecificData = false;
+    mInputTimeSet = false;
     mInputSize = 0u;
-    mInputTimeUs = -1ll;
+    mInputTimeUs = 0;
     mSignalledError = false;
     return C2_OK;
 }
@@ -192,7 +194,9 @@ void C2SoftAacEnc::onRelease() {
 
 c2_status_t C2SoftAacEnc::onFlush_sm() {
     mSentCodecSpecificData = false;
+    mInputTimeSet = false;
     mInputSize = 0u;
+    mInputTimeUs = 0;
     return C2_OK;
 }
 
@@ -329,7 +333,6 @@ void C2SoftAacEnc::process(
 
         mOutBufferSize = encInfo.maxOutBufBytes;
         mNumBytesPerInputFrame = encInfo.frameLength * channelCount * sizeof(int16_t);
-        mInputTimeUs = work->input.ordinal.timestamp;
 
         mSentCodecSpecificData = true;
     }
@@ -342,6 +345,10 @@ void C2SoftAacEnc::process(
         view = work->input.buffers[0]->data().linearBlocks().front().map().get();
         data = view.data();
         capacity = view.capacity();
+    }
+    if (!mInputTimeSet && capacity > 0) {
+        mInputTimeUs = work->input.ordinal.timestamp;
+        mInputTimeSet = true;
     }
     uint64_t timestamp = mInputTimeUs.peeku();
 
@@ -417,12 +424,12 @@ void C2SoftAacEnc::process(
         if (encoderErr == AACENC_OK) {
             if (outargs.numOutBytes > 0) {
                 mInputSize = 0;
-                int consumed = ((capacity / sizeof(int16_t)) - inargs.numInSamples);
+                int consumed = (capacity / sizeof(int16_t)) - inargs.numInSamples
+                        + outargs.numInSamples;
                 mInputTimeUs = work->input.ordinal.timestamp
                         + (consumed * 1000000ll / channelCount / sampleRate);
             } else {
                 mInputSize += outargs.numInSamples * sizeof(int16_t);
-                mInputTimeUs += outargs.numInSamples * 1000000ll / channelCount / sampleRate;
             }
             outPtr += outargs.numOutBytes;
             nOutputBytes += outargs.numOutBytes;
@@ -492,7 +499,9 @@ c2_status_t C2SoftAacEnc::drain(
 
     (void)pool;
     mSentCodecSpecificData = false;
+    mInputTimeSet = false;
     mInputSize = 0u;
+    mInputTimeUs = 0;
 
     // TODO: we don't have any pending work at this time to drain.
     return C2_OK;
